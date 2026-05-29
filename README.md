@@ -37,7 +37,7 @@ jsonpickle
 Install all dependencies:
 
 ```bash
-pip install requests pycryptodome pywidevine jsonpickle
+pip install -r requirements.txt
 ```
 
 ---
@@ -282,4 +282,5 @@ MSL key caches are reused across runs to avoid a full handshake every time. They
 
 ---
 
-**Big thanks to [Hugoved](https://github.com/Hugoved)** for the foundational work on MSL (Message Security Layer) reverse engineering, and the original pywidevine implementation that made this unified handshake toolkit possible. This project builds upon years of community research into Netflix's authentication protocols.
+**Big thanks to [Hugoved](https://github.com/Hugoved)**
+- for the foundational work on MSL (Message Security Layer) reverse engineering, and the original pywidevine implementation that made this unified handshake toolkit possible. This project builds upon years of community research into Netflix's authentication protocols.
