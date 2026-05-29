@@ -29,11 +29,11 @@ from Crypto.Util.Padding import unpad
 def ensure_output_dir(platform_name, base_dir: Optional[Path] = None) -> Path:
     """Create (if needed) and return the ``output`` directory under *base_dir*.
 
-    If *base_dir* is ``None`` it defaults to the directory that contains the
-    calling script (i.e. ``Path(__file__).resolve().parent``).
+    If *base_dir* is ``None`` it defaults to the project root directory
+    (parent of the ``modules`` directory).
     """
     if base_dir is None:
-        base_dir = Path(__file__).resolve().parent
+        base_dir = Path(__file__).resolve().parent.parent
     output_dir = base_dir / "output" / platform_name
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir

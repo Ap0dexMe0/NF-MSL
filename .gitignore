@@ -2,6 +2,7 @@ devices/
 config.ini
 cookies/*
 venv/*
+config.ini
 output/*
 .vscode/*
 modules/__pycache__/

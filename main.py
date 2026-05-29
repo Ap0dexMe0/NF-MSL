@@ -24,10 +24,9 @@ from modules.helpers import (
     build_msl_trace_event, extract_key_id_from_mastertoken, request_args_to_dict,
 )
 from modules.config import setup_config
+from modules.logging import setup_logger
 
-logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
-log = logging.getLogger("MSL HANDSHAKE")
-
+log = setup_logger("MSL HANDSHAKE")
 config = setup_config()
 EMAIL = config["NETFLIX"]["EMAIL"]
 PASSWORD = config["NETFLIX"]["PASSWORD"]
@@ -46,7 +45,7 @@ def setup_session(verify_tls: bool = True) -> requests.Session:
 # ======================================================================
 
 def run_android_rsa(new_msl: bool = False, no_verify: bool = False):
-    logger = logging.getLogger('ANDROID MSL RSA')
+    logger = setup_logger('ANDROID MSL RSA')
     output_dir = ensure_output_dir("android")
     msl_cache_path = output_dir / "msl_keys_cache_android_rsa.json"
     auth_cookies_path = output_dir / "netflix_auth_cookies_rsa.json"
@@ -224,7 +223,7 @@ def run_android_rsa(new_msl: bool = False, no_verify: bool = False):
         
 def run_android(wvd_path: Path,
                 new_msl: bool = False, no_verify: bool = False):
-    log = logging.getLogger('ANDROID MSL')
+    log = setup_logger('ANDROID MSL')
     OUTPUT_DIR = ensure_output_dir("android")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache_android.json"
     AUTH_COOKIES_PATH = OUTPUT_DIR / "netflix_auth_cookies.json"
@@ -517,7 +516,7 @@ def run_android(wvd_path: Path,
 
 def run_ios(wvd_path: Path,
             new_msl: bool = False, no_verify: bool = False):
-    log = logging.getLogger('IOS MSL')
+    log = setup_logger('IOS MSL')
 
     OUTPUT_DIR = ensure_output_dir("ios")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache_ios.json"
@@ -834,7 +833,7 @@ def run_ios(wvd_path: Path,
 
 def run_tv(wvd_path: Path,
            new_msl: bool = False, no_verify: bool = False):
-    log = logging.getLogger('ANDROID TV MSL')
+    log = setup_logger('ANDROID TV MSL')
 
     OUTPUT_DIR = ensure_output_dir("tv")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache.json"
@@ -858,7 +857,7 @@ def run_tv(wvd_path: Path,
     NETJS_VERSION = "3.0.5"
     APK_VERSION = "12.1.9"
     UI_SEM_VER = "44798.0.0"
-    ESN = f"{DEVICE_TYPE}-11233-{generate_esn_random_suffix(64)}"
+    ESN = f"{DEVICE_TYPE}-11233-{''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(64))}"
 
     IMPORTANT_COOKIE_NAMES = (
         "netflix-mfa-nonce",
@@ -1875,7 +1874,7 @@ def run_tv(wvd_path: Path,
 # ======================================================================
 
 def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
-    log = logging.getLogger('ANDROID TV MSL')
+    log = setup_logger('ANDROID TV MSL')
 
     OUTPUT_DIR = ensure_output_dir()
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache.json"
@@ -3031,7 +3030,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
 
 def run_web(new_msl: bool = False, no_verify: bool = False,
             recaptcha_token: str = ''):
-    log = logging.getLogger('BROWSER MSL')
+    log = setup_logger('BROWSER MSL')
 
     OUTPUT_DIR = ensure_output_dir("browser")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache_web.json"
@@ -3491,7 +3490,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
 
 def run_mgk(kpekph_path: Optional[Path], esnid: str,
             new_msl: bool = False):
-    log = logging.getLogger('MGK MSL')
+    log = setup_logger('MGK MSL')
 
     OUTPUT_DIR = ensure_output_dir("mgk")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache_mgk.json"
