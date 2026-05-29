@@ -1,0 +1,6 @@
+devices/
+config.ini
+cookies/*
+venv/*
+output/*
+.vscode/*

@@ -1,0 +1,16 @@
+certifi==2026.5.20
+charset-normalizer==3.4.7
+click==8.4.1
+colorama==0.4.6
+construct==2.8.8
+idna==3.17
+jsonpickle==4.1.2
+protobuf==6.33.6
+pycryptodome==3.23.0
+pycryptodomex==3.23.0
+pymp4==1.4.0
+pywidevine==1.9.0
+PyYAML==6.0.3
+requests==2.34.2
+Unidecode==1.4.0
+urllib3==2.7.0

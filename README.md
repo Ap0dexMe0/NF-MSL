@@ -49,8 +49,10 @@ pip install requests pycryptodome pywidevine jsonpickle
 ├── main.py                  # Entry point — platform router
 ├── config.ini               # Credentials (EMAIL / PASSWORD)
 ├── devices/
-│   ├── changhong_androidtv_16.0.1@001_f2c92ad9_22594_l3.wvd   # L3 Android/iOS WVD
-│   └── hisense_smart_tv_14.0.0_af8be6ec_11233_l1.wvd          # L1 TV WVD
+│   ├── l3.wvd   # L3 Android/iOS WVD
+│   └── l1.wvd          # L1 TV WVD
+│   └── KpeKph          MGK KpeKph platform: base64 encryption + HMAC keys (comma-separated)
+│   └── ESNID           # MGK platform: model-group identity string
 ├── modules/
 │   ├── __init__.py
 │   ├── config.py            # config.ini loader
@@ -58,9 +60,7 @@ pip install requests pycryptodome pywidevine jsonpickle
 │   ├── msl_ios.py           # MSL_IOS class
 │   ├── msl_tv.py            # MSL_TV class
 │   ├── msl_web.py           # MSL_WEB class
-│   └── msl_mgk.py           # MSL_MGK class (Model Group Key)
-├── KpeKph                   # MGK platform: base64 encryption + HMAC keys (comma-separated)
-└── ESNID                    # MGK platform: model-group identity string
+│   └── msl_mgk.py           # MSL_MGK class (Model Group Key)                   
 ```
 
 ---
@@ -85,8 +85,8 @@ Two Widevine Device (`.wvd`) files are included in the `devices/` folder:
 
 | File | Security Level | Used by |
 |------|---------------|---------|
-| `changhong_androidtv_16.0.1@001_f2c92ad9_22594_l3.wvd` | L3 | Android, iOS |
-| `hisense_smart_tv_14.0.0_af8be6ec_11233_l1.wvd` | L1 | TV, TV OTP |
+| `l3.wvd` | L3 | Android, iOS |
+| `l1.wvd` | L1 | TV, TV OTP |
 
 The correct WVD is selected automatically for each platform. The `--wvd` flag lets you override with a custom device file if needed.
 
@@ -283,3 +283,4 @@ MSL key caches are reused across runs to avoid a full handshake every time. They
 ---
 
 **Credits:** [Hugoved](https://github.com/Hugoved)
+**Big thanks to Hugov** for the foundational work on MSL (Message Security Layer) reverse engineering, and the original pywidevine implementation that made this unified handshake toolkit possible. This project builds upon years of community research into Netflix's authentication protocols.
