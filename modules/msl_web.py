@@ -1,54 +1,62 @@
 from __future__ import annotations
+
 import base64
-import gzip
 import json
 import random
-import zlib
-import jsonpickle
-import requests
+from collections import OrderedDict
 from datetime import datetime, timezone
 from http.cookiejar import CookieJar
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from collections import OrderedDict
-from Cryptodome.Cipher import AES, PKCS1_OAEP
-from Cryptodome.Hash import HMAC, SHA256
+
+import jsonpickle
+import requests
+from Cryptodome.Cipher import PKCS1_OAEP
 from Cryptodome.PublicKey import RSA
 from Cryptodome.PublicKey.RSA import RsaKey
-from Cryptodome.Random import get_random_bytes
-from Cryptodome.Util import Padding
+
+from .msl_base import MSLBase, MSLKeys as _BaseMSLKeys
 
 
-class MSLObject:
-    def __repr__(self) -> str:
-        return f"<{self.__class__.__name__} {jsonpickle.encode(self, unpicklable=False)}>"
+# ---------------------------------------------------------------------------
+# Platform-specific key container
+# ---------------------------------------------------------------------------
 
+class MSLKeys(_BaseMSLKeys):
+    """Web MSL keys – extends the base with an RSA key (no CDM session)."""
 
-class MSLKeys(MSLObject):
     def __init__(
         self,
         encryption: Optional[bytes] = None,
         sign: Optional[bytes] = None,
         rsa: Optional[RsaKey] = None,
         mastertoken: Optional[dict] = None,
-    ):
-        self.encryption = encryption
-        self.sign = sign
+    ) -> None:
+        super().__init__(encryption=encryption, sign=sign, mastertoken=mastertoken)
         self.rsa = rsa
-        self.mastertoken = mastertoken
 
 
-class MSL_WEB:
-    DEFAULT_HANDSHAKE_ENDPOINT = "https://www.netflix.com/nq/msl_v1/nrdjs/pbo_tokens/%5E1.0.0/router"
-    DEFAULT_USER_AGENT = (
+# ---------------------------------------------------------------------------
+# MSL_WEB
+# ---------------------------------------------------------------------------
+
+class MSL_WEB(MSLBase):
+    """Netflix MSL client for web browsers using RSA key exchange."""
+
+    # -- Platform constants --------------------------------------------------
+    DEFAULT_HANDSHAKE_ENDPOINT: str = (
+        "https://www.netflix.com/nq/msl_v1/nrdjs/pbo_tokens/%5E1.0.0/router"
+    )
+    DEFAULT_USER_AGENT: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/146.0.0.0 Safari/537.36"
     )
-    DEFAULT_REQUEST_CONTEXT = '{"appstate":"foreground"}'
-    DEFAULT_NRDJS_VERSION = "v3.11.512"
-    DEFAULT_NETJS_VERSION = "3.0.5"
+    DEFAULT_REQUEST_CONTEXT: str = '{"appstate":"foreground"}'
+    DEFAULT_NRDJS_VERSION: str = "v3.11.512"
+    DEFAULT_NETJS_VERSION: str = "3.0.5"
+
+    # -- Constructor ---------------------------------------------------------
 
     def __init__(
         self,
@@ -57,12 +65,11 @@ class MSL_WEB:
         message_id: int,
         sender: str,
         user_auth: Optional[dict] = None,
-    ):
-        self.session = session
-        self.keys = keys
-        self.sender = sender
+    ) -> None:
+        super().__init__(session=session, keys=keys, message_id=message_id, sender=sender)
         self.user_auth = user_auth
-        self.message_id = message_id
+
+    # -- RSA handshake -------------------------------------------------------
 
     @classmethod
     def handshake(
@@ -75,6 +82,7 @@ class MSL_WEB:
         endpoint: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> MSLKeys:
+        """Perform an RSA (ASYMMETRIC_WRAPPED) key exchange."""
         if cookies:
             session.cookies.update(cookies)
 
@@ -140,7 +148,9 @@ class MSL_WEB:
             timeout=30,
         )
         if response.status_code != 200:
-            raise RuntimeError(f"Key exchange failed: HTTP {response.status_code} {response.text[:500]}")
+            raise RuntimeError(
+                f"Key exchange failed: HTTP {response.status_code} {response.text[:500]}"
+            )
 
         parsed = cls.parse_concatenated_json(response.text)
         if not parsed:
@@ -148,25 +158,41 @@ class MSL_WEB:
 
         header = parsed[0]
         if "errordata" in header:
-            decoded_error = base64.standard_b64decode(header["errordata"]).decode("utf-8")
+            decoded_error = base64.standard_b64decode(header["errordata"]).decode(
+                "utf-8"
+            )
             raise RuntimeError(f"Key exchange failed: {decoded_error}")
         if "headerdata" not in header:
-            raise RuntimeError(f"Key exchange failed: missing headerdata: {str(header)[:500]}")
+            raise RuntimeError(
+                f"Key exchange failed: missing headerdata: {str(header)[:500]}"
+            )
 
-        header_json = json.loads(base64.standard_b64decode(header["headerdata"]).decode("utf-8"))
+        header_json = json.loads(
+            base64.standard_b64decode(header["headerdata"]).decode("utf-8")
+        )
         key_data = header_json["keyresponsedata"]["keydata"]
 
         cipher_rsa = PKCS1_OAEP.new(keys.rsa)
         keys.encryption = cls.base64key_decode(
-            json.loads(cipher_rsa.decrypt(base64.standard_b64decode(key_data["encryptionkey"])).decode("utf-8"))["k"]
+            json.loads(
+                cipher_rsa.decrypt(
+                    base64.standard_b64decode(key_data["encryptionkey"])
+                ).decode("utf-8")
+            )["k"]
         )
         keys.sign = cls.base64key_decode(
-            json.loads(cipher_rsa.decrypt(base64.standard_b64decode(key_data["hmackey"])).decode("utf-8"))["k"]
+            json.loads(
+                cipher_rsa.decrypt(
+                    base64.standard_b64decode(key_data["hmackey"])
+                ).decode("utf-8")
+            )["k"]
         )
         keys.mastertoken = header_json["keyresponsedata"]["mastertoken"]
 
         cls.cache_keys(keys, cache_path)
         return keys
+
+    # -- Platform-specific request headers -----------------------------------
 
     @staticmethod
     def build_request_headers(
@@ -179,6 +205,7 @@ class MSL_WEB:
         expiry_timeout: Optional[int] = 12750,
         extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
+        """Build the HTTP headers required for Web MSL requests."""
         headers: Dict[str, str] = {
             "User-Agent": user_agent or MSL_WEB.DEFAULT_USER_AGENT,
             "Accept": "*/*",
@@ -207,6 +234,8 @@ class MSL_WEB:
             headers.update(extra_headers)
         return headers
 
+    # -- Custom generate_msg_header (empty languages / encoderformats) -------
+
     @staticmethod
     def generate_msg_header(
         message_id: int,
@@ -216,6 +245,11 @@ class MSL_WEB:
         keyrequestdata: Optional[dict] = None,
         compression: Optional[str] = "GZIP",
     ) -> str:
+        """Generate an MSL message header with Web-specific capabilities.
+
+        The Web platform sends empty ``languages`` and ``encoderformats``
+        arrays in the capabilities block.
+        """
         header_data: Dict[str, Any] = {
             "messageid": message_id,
             "renewable": True,
@@ -236,6 +270,8 @@ class MSL_WEB:
             header_data["keyrequestdata"] = [keyrequestdata]
         return jsonpickle.encode(header_data, unpicklable=False)
 
+    # -- Web-specific send_message (no PBO normalisation) --------------------
+
     def send_message(
         self,
         endpoint: str,
@@ -244,177 +280,51 @@ class MSL_WEB:
         userauthdata: Optional[dict] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> Tuple[Dict[str, Any], Any]:
+        """Send an MSL message without PBO payload normalisation.
+
+        Raises :class:`RuntimeError` on MSL errors.
+        """
         message = self.create_message(application_data, userauthdata)
-        response = self.session.post(url=endpoint, params=params, data=message, headers=headers, timeout=30)
+        response = self.session.post(
+            url=endpoint, params=params, data=message, headers=headers, timeout=30
+        )
         response.raise_for_status()
         header, payload = self.parse_message(response.text)
         if "errordata" in header:
-            decoded_error = json.loads(base64.standard_b64decode(header["errordata"]).decode("utf-8"))
+            decoded_error = json.loads(
+                base64.standard_b64decode(header["errordata"]).decode("utf-8")
+            )
             raise RuntimeError(f"MSL response contains an error: {decoded_error}")
         return header, payload
 
-    def create_message(self, application_data: Any, userauthdata: Optional[dict] = None) -> str:
-        self.message_id += 1
-        headerdata = self.encrypt(
-            self.generate_msg_header(
-                message_id=self.message_id,
-                sender=self.sender,
-                is_handshake=False,
-                userauthdata=userauthdata,
-            )
-        )
-
-        message = json.dumps(
-            {
-                "headerdata": base64.standard_b64encode(headerdata.encode("utf-8")).decode("utf-8"),
-                "signature": self.sign(headerdata).decode("utf-8"),
-                "mastertoken": self.keys.mastertoken,
-            },
-            separators=(",", ":"),
-        )
-
-        compressed_data = self.gzip_compress(json.dumps(application_data, separators=(",", ":")).encode("utf-8")).decode("utf-8")
-        payloads = [
-            {
-                "sequencenumber": 1,
-                "messageid": self.message_id,
-                "compressionalgo": "GZIP",
-                "data": compressed_data,
-            },
-            {
-                "sequencenumber": 2,
-                "messageid": self.message_id,
-                "endofmsg": True,
-                "data": "",
-            },
-        ]
-
-        for payload in payloads:
-            encrypted_chunk = self.encrypt(json.dumps(payload, separators=(",", ":")))
-            message += json.dumps(
-                {
-                    "payload": base64.standard_b64encode(encrypted_chunk.encode("utf-8")).decode("utf-8"),
-                    "signature": self.sign(encrypted_chunk).decode("utf-8"),
-                },
-                separators=(",", ":"),
-            )
-        return message
-
-    def parse_message(self, message: str) -> Tuple[Dict[str, Any], Any]:
-        parsed = self.parse_concatenated_json(message)
-        header = parsed[0]
-        payload_chunks = parsed[1:] if len(parsed) > 1 else []
-        payload = self.decrypt_payload_chunks(payload_chunks) if payload_chunks else {}
-        return header, payload
-
-    def decrypt_payload_chunks(self, payload_chunks: List[Dict[str, str]]) -> Any:
-        if not self.keys.encryption:
-            raise ValueError("Encryption key is not available")
-
-        raw_data = ""
-        for payload_chunk in payload_chunks:
-            chunk_json = json.loads(base64.standard_b64decode(payload_chunk["payload"]).decode("utf-8"))
-            decrypted = AES.new(
-                key=self.keys.encryption,
-                mode=AES.MODE_CBC,
-                iv=base64.standard_b64decode(chunk_json["iv"]),
-            ).decrypt(base64.standard_b64decode(chunk_json["ciphertext"]))
-            decrypted = Padding.unpad(decrypted, 16)
-            payload_json = json.loads(decrypted.decode("utf-8"))
-
-            payload_data = base64.standard_b64decode(payload_json["data"])
-            if payload_json.get("compressionalgo") == "GZIP":
-                payload_data = zlib.decompress(payload_data, 16 + zlib.MAX_WBITS)
-            raw_data += payload_data.decode("utf-8")
-
-        data = json.loads(raw_data)
-        if "error" in data:
-            return None
-        return data.get("result", data)
-
-    def encrypt(self, plaintext: str) -> str:
-        if not self.keys.encryption:
-            raise ValueError("Encryption key is not available")
-        if not self.keys.mastertoken:
-            raise ValueError("Master token is not available")
-
-        iv = get_random_bytes(16)
-        tokendata = json.loads(base64.standard_b64decode(self.keys.mastertoken["tokendata"]).decode("utf-8"))
-        ciphertext = AES.new(self.keys.encryption, AES.MODE_CBC, iv).encrypt(Padding.pad(plaintext.encode("utf-8"), 16))
-        return json.dumps(
-            {
-                "ciphertext": base64.standard_b64encode(ciphertext).decode("utf-8"),
-                "keyid": f"{self.sender}_{tokendata['sequencenumber']}",
-                "sha256": "AA==",
-                "iv": base64.standard_b64encode(iv).decode("utf-8"),
-            },
-            separators=(",", ":"),
-        )
-
-    def sign(self, text: str) -> bytes:
-        if not self.keys.sign:
-            raise ValueError("Sign key is not available")
-        return base64.standard_b64encode(HMAC.new(self.keys.sign, text.encode("utf-8"), SHA256).digest())
-
-    @staticmethod
-    def parse_concatenated_json(message: str) -> List[Dict[str, Any]]:
-        decoder = json.JSONDecoder()
-        items: List[Dict[str, Any]] = []
-        index = 0
-        while index < len(message):
-            while index < len(message) and message[index].isspace():
-                index += 1
-            if index >= len(message):
-                break
-            item, index = decoder.raw_decode(message, index)
-            items.append(item)
-        return items
-
-    @staticmethod
-    def gzip_compress(data: bytes) -> bytes:
-        out = BytesIO()
-        with gzip.GzipFile(fileobj=out, mode="w") as handle:
-            handle.write(data)
-        return base64.standard_b64encode(out.getvalue())
-
-    @staticmethod
-    def base64key_decode(payload: str) -> bytes:
-        remainder = len(payload) % 4
-        if remainder == 2:
-            payload += "=="
-        elif remainder == 3:
-            payload += "="
-        elif remainder != 0:
-            raise ValueError("Invalid base64 string")
-        return base64.urlsafe_b64decode(payload.encode("utf-8"))
+    # -- Cache I/O overrides (RSA key serialisation) -------------------------
 
     @staticmethod
     def load_cache_data(msl_keys_path: Optional[Path] = None) -> Optional[MSLKeys]:
-        if not msl_keys_path or not msl_keys_path.is_file():
+        """Load cached keys, re-importing the RSA key from its PEM form."""
+        msl_keys = MSLBase.load_cache_data(msl_keys_path)
+        if msl_keys is None:
             return None
-
-        msl_keys = jsonpickle.decode(msl_keys_path.read_text(encoding="utf-8"))
-        if msl_keys.rsa:
+        # Re-import RSA key from serialised PEM form
+        if getattr(msl_keys, "rsa", None):
             msl_keys.rsa = RSA.import_key(msl_keys.rsa)
-
-        if msl_keys.mastertoken:
-            tokendata = json.loads(base64.standard_b64decode(msl_keys.mastertoken["tokendata"]).decode("utf-8"))
-            renewal_window = datetime.fromtimestamp(int(tokendata["renewalwindow"]), tz=timezone.utc)
-            if (renewal_window - datetime.now(timezone.utc)).total_seconds() / 3600 < 10:
-                return None
         return msl_keys
 
     @staticmethod
     def cache_keys(msl_keys: MSLKeys, msl_keys_path: Path) -> None:
+        """Persist keys, exporting the RSA key to PEM for JSON compatibility."""
         original_rsa = msl_keys.rsa
         if msl_keys.rsa:
             msl_keys.rsa = msl_keys.rsa.export_key()
-        msl_keys_path.write_text(jsonpickle.encode(msl_keys, indent=4), encoding="utf-8")
+        MSLBase.cache_keys(msl_keys, msl_keys_path)
         if original_rsa:
             msl_keys.rsa = original_rsa
 
+    # -- Cookie-jar helpers (Web-specific) -----------------------------------
+
     @staticmethod
     def cookiejar_to_list(cookie_jar: CookieJar) -> List[Dict[str, Any]]:
+        """Serialise a :class:`CookieJar` to a list of dicts."""
         cookies: List[Dict[str, Any]] = []
         for cookie in cookie_jar:
             cookies.append(
@@ -433,13 +343,17 @@ class MSL_WEB:
 
     @staticmethod
     def cookiejar_to_ordered_dict(cookie_jar: CookieJar) -> Dict[str, str]:
+        """Convert a :class:`CookieJar` to an :class:`OrderedDict` of name→value."""
         cookies: Dict[str, str] = OrderedDict()
         for cookie in cookie_jar:
             cookies[cookie.name] = cookie.value
         return cookies
 
     @staticmethod
-    def save_cookie_values(cookie_jar: CookieJar, output_path: str | Path) -> Dict[str, str]:
+    def save_cookie_values(
+        cookie_jar: CookieJar, output_path: str | Path
+    ) -> Dict[str, str]:
+        """Save cookie name→value pairs to a JSON file and return them."""
         path = Path(output_path)
         payload = MSL_WEB.cookiejar_to_ordered_dict(cookie_jar)
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -447,11 +361,19 @@ class MSL_WEB:
 
     @staticmethod
     def save_cookiejar(cookie_jar: CookieJar, output_path: str | Path) -> None:
+        """Save the full cookie jar to a JSON file."""
         path = Path(output_path)
-        path.write_text(json.dumps(MSL_WEB.cookiejar_to_list(cookie_jar), indent=2), encoding="utf-8")
+        path.write_text(
+            json.dumps(MSL_WEB.cookiejar_to_list(cookie_jar), indent=2),
+            encoding="utf-8",
+        )
 
     @staticmethod
-    def load_cookiejar(session: requests.Session, source: str | Path | Iterable[Dict[str, Any]] | Dict[str, str]) -> None:
+    def load_cookiejar(
+        session: requests.Session,
+        source: str | Path | Iterable[Dict[str, Any]] | Dict[str, str],
+    ) -> None:
+        """Load cookies into *session* from a file path, iterable, or dict."""
         if isinstance(source, (str, Path)):
             path = Path(source)
             if not path.is_file():
@@ -474,3 +396,6 @@ class MSL_WEB:
                 expires=item.get("expires"),
                 rest=item.get("rest", {}),
             )
+
+
+__all__ = ["MSL_WEB", "MSLKeys"]

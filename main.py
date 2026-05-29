@@ -9,8 +9,20 @@ from urllib.parse import quote, urlencode
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from pywidevine import Cdm as WidevineCdm, Device as WidevineDevice
-from modules import MSL_ANDROID, MSL_IOS, MSL_TV, MSL_WEB, MSL_MGK
-from modules.msl_mgk import UserAuthentication
+from modules.msl_android import MSL_ANDROID
+from modules.msl_ios import MSL_IOS
+from modules.msl_tv import MSL_TV
+from modules.msl_web import MSL_WEB
+from modules.msl_mgk import MSL_MGK
+from modules.helpers import (
+    ensure_output_dir, restore_auth_cookies, get_nfvdid, get_flow_session_cookies,
+    save_session_cookies, build_cookie_header, apply_set_cookie_headers,
+    dedupe_important_cookies, collect_important_cookies, generate_hex_id,
+    generate_netflix_uuid, generate_request_id, generate_esn_random_suffix,
+    decrypt_msl_header, extract_clcs_session_id, extract_rendition_id,
+    parse_flow_data, parse_msl_payload, extract_useridtoken_from_payload,
+    build_msl_trace_event, extract_key_id_from_mastertoken, request_args_to_dict,
+)
 from modules.config import setup_config
 
 logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
@@ -20,16 +32,200 @@ config = setup_config()
 EMAIL = config["NETFLIX"]["EMAIL"]
 PASSWORD = config["NETFLIX"]["PASSWORD"]
 
+def setup_session(verify_tls: bool = True) -> requests.Session:
+    session = requests.Session()
+    session.verify = verify_tls
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+    })
+    return session
+
 # ======================================================================
 # ANDROID
 # ======================================================================
 
+def run_android_rsa(new_msl: bool = False, no_verify: bool = False):
+    logger = logging.getLogger('ANDROID MSL RSA')
+    output_dir = ensure_output_dir("android")
+    msl_cache_path = output_dir / "msl_keys_cache_android_rsa.json"
+    auth_cookies_path = output_dir / "netflix_auth_cookies_rsa.json"
+    useridtoken_path = output_dir / "netflix_auth_useridtoken_rsa.json"
+    tokens_output_path = output_dir / "netflix_auth_tokens_rsa.json"
+
+    # NFCDCH-02-* ESN is accepted by the Android FTL endpoint without a WVD
+    esn = f"NFCDCH-02-{''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(32))}"
+    user_agent = f"com.netflix.mediaclient/63988 (Linux; U; Android 15; en_US; SM-F711N; Build/AP3A.240905.015.A2; Cronet/143.0.7445.0)"
+    device_model = "SM-F711N"
+
+    session = setup_session(verify_tls=True)
+
+    response = session.post(
+        "https://android15.appboot.netflix.com/appboot/NFANDROID1-PRV-P-",
+        params={"keyVersion": "1"},
+        headers={
+            "Host": "android15.appboot.netflix.com",
+            "X-Netflix.Request.Client.Context": '{"appView":"unknown","appState":"foreground"}',
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": user_agent,
+            "Accept-Encoding": "gzip, deflate, br",
+        },
+        timeout=30,
+    )
+    nfvdid = get_nfvdid(session, response)
+    logger.info("Initial nfvdid cookie obtained")
+
+    msl_headers = MSL_ANDROID.build_request_headers(
+        request_name="getProxyEsn",
+        user_agent=user_agent,
+        referer=None,
+        esn=esn,
+        expiry_timeout=12750,
+        host="android15.prod.cloud.netflix.com",
+        language="en-US,en",
+        device_model=quote(device_model, safe=""),
+        extra_headers={
+            "Accept-Encoding": "gzip, deflate, br",
+            "Content-Encoding": "msl_v1",
+            "x-netflix.zuul.brotli.allowed": "true",
+            "x-netflix.appver": "9.60.0",
+            "x-netflix.clienttype": "samurai",
+            "x-netflix.request.client.context": '{"appView":"unknown","appState":"foreground"}',
+            "x-netflix.esnprefix": "NFANDROID1-PRV-P-",
+            "x-netflix.request.uuid": f"{generate_hex_id(8)}-{generate_hex_id(4)}-{generate_hex_id(4)}-{generate_hex_id(4)}-{generate_hex_id(12)}",
+            "x-netflix.androidapi": "35",
+            "x-netflix.deviceformfactor": "PHONE",
+            "x-netflix.devicememorylevel": "HIGH",
+            "x-netflix.request.attempt": "1",
+            "x-netflix.request.id": generate_hex_id(32),
+            "Content-Type": "application/json",
+            "x-netflix.client.request.name": "getProxyEsn",
+            "x-netflix.request.routing": '{"path":"\\/nq\\/android\\/playback\\/~1.0.0\\/router"}',
+            "user-agent": user_agent,
+        },
+    )
+
+    logger.info("Performing RSA/ASYMMETRIC_WRAPPED MSL handshake (no WVD needed)")
+    msl_keys = MSL_ANDROID.rsa_handshake(
+        msl_keys_path=str(msl_cache_path),
+        session=session,
+        sender=esn,
+        new_msl=new_msl,
+        cookies={"nfvdid": nfvdid},
+        endpoint="https://android.prod.ftl.netflix.com/nq/androidui/pbo_license/~1.0.0/router",
+        headers=msl_headers,
+    )
+
+    msl_client = MSL_ANDROID(
+        session=session,
+        keys=msl_keys,
+        message_id=random.randint(0, 2**52),
+        sender=esn,
+        drm="widevine",
+    )
+
+    logger.info("MSL RSA key exchange completed")
+
+    # The NFCDCH-02-* ESN triggers the web CLCS auth flow (not samurai useridtoken).
+    # After the MSL handshake the HTTP session carries Netflix cookies, so we use
+    # the same CLCSScreenUpdate GraphQL path that run_web() uses.
+    logger.info("Fetching login page and extracting CLCS session context")
+    login_response = session.get("https://www.netflix.com/login", timeout=30)
+    login_html = login_response.text
+
+    clcs_session_id = None
+    rendition_id = None
+    patterns = [
+        r'clcsSessionId[\\"\'": ]+([0-9a-f\-]{36})',
+        r'(?<!clcs)renditionId[\\"\'": ]+([0-9a-f\-]{36})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, login_html)
+        if match:
+            if not clcs_session_id:
+                clcs_session_id = match.group(1)
+            elif not rendition_id:
+                rendition_id = match.group(1)
+
+    if not clcs_session_id or not rendition_id:
+        logger.error("Could not extract CLCS session IDs from login page")
+        sys.exit(1)
+
+    logger.info("Submitting credentials via CLCSScreenUpdate (web flow)")
+
+    full_variables = {
+        "format": "HTML", "imageFormat": "PNG", "locale": "en-US",
+        "serverState": json.dumps({
+            "realm": "growth", "name": "PASSWORD_LOGIN",
+            "clcsSessionId": clcs_session_id,
+            "sessionContext": {
+                "session-breadcrumbs": {"funnel_name": "loginWeb"},
+                "login.navigationSettings": {"hideOtpToggle": True},
+            },
+        }, separators=(",", ":")),
+        "serverScreenUpdate": json.dumps({
+            "realm": "custom", "name": "growthLoginByPassword",
+            "metadata": {"recaptchaSiteKey": "6Lf8hrcUAAAAAIpQAFW2VFjtiYnThOjZOA5xvLyR"},
+            "loggingAction": "Submitted", "loggingCommand": "SubmitCommand",
+            "referrerRenditionId": rendition_id,
+        }, separators=(",", ":")),
+        "inputFields": [
+            {"name": "password", "value": {"stringValue": PASSWORD}},
+            {"name": "userLoginId", "value": {"stringValue": EMAIL}},
+            {"name": "countryCode", "value": {"stringValue": "1"}},
+            {"name": "countryIsoCode", "value": {"stringValue": "US"}},
+            {"name": "recaptchaResponseTime", "value": {"intValue": 445}},
+            {"name": "recaptchaResponseToken", "value": {"stringValue": ""}},
+        ],
+    }
+
+    response = session.post(
+        "https://web.prod.cloud.netflix.com/graphql",
+        json={
+            "operationName": "CLCSScreenUpdate",
+            "variables": full_variables,
+            "extensions": {"persistedQuery": {"id": "1c276cdf-caef-49cf-b38e-384972c2b47e", "version": 102}},
+        },
+        headers={
+            "User-Agent": user_agent,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": "https://www.netflix.com",
+            "Referer": "https://www.netflix.com/login",
+        },
+        timeout=30,
+    )
+    login_resp_json = response.json()
+    if "errors" in login_resp_json:
+        logger.error("CLCSScreenUpdate failed: %s", login_resp_json["errors"])
+        sys.exit(1)
+
+    # Check login result
+    data = login_resp_json.get("data", {})
+    result_block = data.get("result", {}) if isinstance(data, dict) else {}
+    status = result_block.get("status") if isinstance(result_block, dict) else None
+
+    # Finalise the session
+    session.get("https://www.netflix.com/browse", timeout=30)
+
+    auth_cookies = {cookie.name: cookie.value for cookie in session.cookies}
+    auth_cookies_path.write_text(json.dumps(auth_cookies, indent=2), encoding="utf-8")
+    logger.info("Authentication cookies saved")
+
+    has_netflix_id = "NetflixId" in auth_cookies
+    if status == "SUCCESS" or has_netflix_id:
+        logger.info("LOGIN SUCCESSFUL")
+        tokens_output_path.write_text(json.dumps(login_resp_json, indent=4), encoding="utf-8")
+        result = {"status": "SUCCESS", "auth_cookies": auth_cookies}
+        # print(json.dumps(result, indent=2))
+    else:
+        logger.error("LOGIN FAILED — status=%s cookies=%s", status, list(auth_cookies.keys()))
+        sys.exit(1)
+        
 def run_android(wvd_path: Path,
                 new_msl: bool = False, no_verify: bool = False):
     log = logging.getLogger('ANDROID MSL')
-    BASE_DIR = Path(__file__).resolve().parent
-    OUTPUT_DIR = BASE_DIR / "output"
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR = ensure_output_dir("android")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache_android.json"
     AUTH_COOKIES_PATH = OUTPUT_DIR / "netflix_auth_cookies.json"
     USERIDTOKEN_PATH = OUTPUT_DIR / "netflix_auth_useridtoken.json"
@@ -56,7 +252,7 @@ def run_android(wvd_path: Path,
     VERIFY_TLS = True
     RESTORE_AUTH_COOKIES = False
 
-    ESN = f"NFANDROID1-PRV-P-SAMSUSM-F711N-22594-{''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(64))}"
+    ESN = f"NFANDROID1-PRV-P-SAMSUSM-F711N-22594-{generate_esn_random_suffix(64)}"
 
     REQUEST_CLIENT_CONTEXT_UNKNOWN = '{"appView":"unknown","appState":"foreground"}'
     APPBOOT_REQUEST_CLIENT_CONTEXT = '{"appView":"unknown","appState":"foreground"}'
@@ -70,13 +266,8 @@ def run_android(wvd_path: Path,
         }
     )
 
-    if RESTORE_AUTH_COOKIES and AUTH_COOKIES_PATH.exists():
-        try:
-            cached_auth_cookies = json.loads(AUTH_COOKIES_PATH.read_text(encoding="utf-8"))
-            if isinstance(cached_auth_cookies, dict):
-                session.cookies.update(cached_auth_cookies)
-        except Exception as exc:
-            log.warning("Saved authentication cookies could not be restored: %s", exc)
+    if RESTORE_AUTH_COOKIES:
+        restore_auth_cookies(session, AUTH_COOKIES_PATH, log)
 
     log.info("Initializing session")
     response = session.get(NETFLIX_CANONICAL_URL, timeout=30, allow_redirects=True)
@@ -102,17 +293,7 @@ def run_android(wvd_path: Path,
         timeout=30,
     )
 
-    nfvdid = ""
-    for cookie in session.cookies:
-        if cookie.name == "nfvdid":
-            nfvdid = cookie.value
-            break
-
-    if not nfvdid:
-        nfvdid = response.cookies.get("nfvdid", "")
-
-    if not nfvdid:
-        raise RuntimeError("The initial nfvdid cookie was not returned")
+    nfvdid = get_nfvdid(session, response)
 
     log.info("Initial nfvdid cookie obtained")
 
@@ -142,21 +323,13 @@ def run_android(wvd_path: Path,
             "x-netflix.request.client.context": REQUEST_CLIENT_CONTEXT_UNKNOWN,
             "x-netflix.esnprefix": "NFANDROID1-PRV-P-",
             "x-netflix.request.uuid": (
-                "".join(random.choice("0123456789abcdef") for _ in range(8))
-                + "-"
-                + "".join(random.choice("0123456789abcdef") for _ in range(4))
-                + "-"
-                + "".join(random.choice("0123456789abcdef") for _ in range(4))
-                + "-"
-                + "".join(random.choice("0123456789abcdef") for _ in range(4))
-                + "-"
-                + "".join(random.choice("0123456789abcdef") for _ in range(12))
+                generate_netflix_uuid()
             ),
             "x-netflix.androidapi": "35",
             "x-netflix.deviceformfactor": "PHONE",
             "x-netflix.devicememorylevel": "HIGH",
             "x-netflix.request.attempt": "1",
-            "x-netflix.request.id": "".join(random.choice("0123456789abcdef") for _ in range(32)),
+            "x-netflix.request.id": generate_request_id(),
             "Content-Type": "application/json",
             "x-netflix.client.request.name": "getProxyEsn",
             "x-netflix.request.routing": '{"path":"\\/nq\\/android\\/playback\\/~1.0.0\\/router"}',
@@ -189,12 +362,7 @@ def run_android(wvd_path: Path,
         drm="widevine",
     )
 
-    flow_session_id = ""
-    for cookie in session.cookies:
-        if cookie.name == "nfvdid":
-            nfvdid = cookie.value
-        elif cookie.name == "flwssn":
-            flow_session_id = cookie.value
+    nfvdid, flow_session_id = get_flow_session_cookies(session)
 
     log.info("MSL Widevine exchange completed")
 
@@ -309,39 +477,7 @@ def run_android(wvd_path: Path,
         sys.exit(1)
 
     try:
-        encrypted_header_b64 = confirm_login_header["headerdata"]
-        encryption_key_value = msl_client.keys.encryption
-        sign_key_value = msl_client.keys.sign
-
-        if isinstance(encryption_key_value, str):
-            try:
-                encryption_key = bytes.fromhex(encryption_key_value)
-            except ValueError:
-                encryption_key = encryption_key_value.encode("utf-8")
-        else:
-            encryption_key = encryption_key_value
-
-        if isinstance(sign_key_value, str):
-            try:
-                sign_key = bytes.fromhex(sign_key_value)
-            except ValueError:
-                sign_key = sign_key_value.encode("utf-8")
-        else:
-            sign_key = sign_key_value
-
-        if not encryption_key:
-            raise RuntimeError("The encryption key is missing")
-
-        if not sign_key:
-            raise RuntimeError("The sign key is missing")
-
-        encrypted_header = json.loads(base64.b64decode(encrypted_header_b64))
-        iv = base64.b64decode(encrypted_header["iv"])
-        ciphertext = base64.b64decode(encrypted_header["ciphertext"])
-
-        cipher = AES.new(encryption_key, AES.MODE_CBC, iv)
-        decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
-        header_data = json.loads(decrypted.decode("utf-8"))
+        header_data = decrypt_msl_header(confirm_login_header["headerdata"], msl_client.keys.encryption, msl_client.keys.sign)
     except Exception:
         log.exception("Failed to decrypt MSL header")
         sys.exit(1)
@@ -360,15 +496,9 @@ def run_android(wvd_path: Path,
         log.exception("Failed to save token files")
         sys.exit(1)
 
-    auth_cookies = {}
-    for cookie in session.cookies:
-        auth_cookies[cookie.name] = cookie.value
-
     try:
-        AUTH_COOKIES_PATH.write_text(json.dumps(auth_cookies, indent=2), encoding="utf-8")
-        log.info("Authentication cookies saved to: %s", AUTH_COOKIES_PATH)
+        auth_cookies = save_session_cookies(session, AUTH_COOKIES_PATH, log)
     except Exception:
-        log.exception("Failed to save cookies")
         sys.exit(1)
 
     result = {
@@ -378,7 +508,7 @@ def run_android(wvd_path: Path,
     }
 
     log.info("VerifyLoginMslRequest succeeded")
-    print(json.dumps(result, indent=2))
+    # print(json.dumps(result, indent=2))
 
 
 # ======================================================================
@@ -387,16 +517,9 @@ def run_android(wvd_path: Path,
 
 def run_ios(wvd_path: Path,
             new_msl: bool = False, no_verify: bool = False):
-    from Crypto.Cipher import AES
-    from Crypto.Util.Padding import unpad
     log = logging.getLogger('IOS MSL')
 
-    from typing import Any, Dict
-
-
-    BASE_DIR = Path(__file__).resolve().parent
-    OUTPUT_DIR = BASE_DIR / "output"
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR = ensure_output_dir("ios")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache_ios.json"
     AUTH_COOKIES_PATH = OUTPUT_DIR / "netflix_auth_cookies.json"
 
@@ -419,7 +542,7 @@ def run_ios(wvd_path: Path,
     LOCALE = "en-US"
     DEVICE_MODEL = "iPhone15,3"
 
-    ESN = f"NFANDROID1-PRV-P-IPHONE15=3-22594-{''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(64))}"
+    ESN = f"NFANDROID1-PRV-P-IPHONE15=3-22594-{generate_esn_random_suffix(64)}"
 
     REQUEST_CLIENT_CONTEXT_LANDING = '{"appView":"nmLanding","appState":"foreground"}'
     REQUEST_CLIENT_CONTEXT_IDENTIFIER = '{"appView":"login","appState":"foreground"}'
@@ -450,13 +573,8 @@ def run_ios(wvd_path: Path,
         "Accept": "*/*",
     })
 
-    if restore_auth_cookies and AUTH_COOKIES_PATH.exists():
-        try:
-            cached_auth_cookies = json.loads(AUTH_COOKIES_PATH.read_text(encoding="utf-8"))
-            if isinstance(cached_auth_cookies, dict):
-                session.cookies.update(cached_auth_cookies)
-        except Exception as exc:
-            log.warning("Saved auth cookies could not be restored: %s", exc)
+    if restore_auth_cookies:
+        restore_auth_cookies(session, AUTH_COOKIES_PATH, log)
 
     log.info("Initializing session")
     response = session.get(NETFLIX_CANONICAL_URL, timeout=30, allow_redirects=True)
@@ -466,7 +584,7 @@ def run_ios(wvd_path: Path,
     response.raise_for_status()
 
     log.info("Requesting initial nfvdid cookie")
-    appboot_request_id = "".join(random.choice("0123456789abcdef") for _ in range(32))
+    appboot_request_id = generate_request_id()
 
     appboot_headers = {
         "Host": "ios18.appboot.netflix.com",
@@ -491,20 +609,9 @@ def run_ios(wvd_path: Path,
         timeout=30,
     ) 
 
-    nfvdid = ""
-    for cookie in session.cookies:
-        if cookie.name == "nfvdid":
-            nfvdid = cookie.value
-            break
-
-    if not nfvdid:
-        nfvdid = response.cookies.get("nfvdid", "")
-
-    if not nfvdid:
-        raise RuntimeError("The initial nfvdid cookie was not returned")
+    nfvdid = get_nfvdid(session, response)
 
     log.info("Initial nfvdid cookie obtained")
-
     log.info("Starting MSL Widevine exchange")
 
     if not wvd_path.exists():
@@ -561,12 +668,7 @@ def run_ios(wvd_path: Path,
         drm="widevine",
     )
 
-    flow_session_id = ""
-    for cookie in session.cookies:
-        if cookie.name == "nfvdid":
-            nfvdid = cookie.value
-        elif cookie.name == "flwssn":
-            flow_session_id = cookie.value
+    nfvdid, flow_session_id = get_flow_session_cookies(session)
 
     log.info("MSL Widevine exchange completed")
 
@@ -582,7 +684,7 @@ def run_ios(wvd_path: Path,
         "x-netflix.context.feature-capabilities": FEATURE_CAPABILITIES,
         "x-netflix.context.operation-name": operation_name,
         "X-Netflix.request.expiry.timeout": "15000",
-        "X-Netflix.Request.Id": "".join(random.choice("0123456789abcdef") for _ in range(32)),
+        "X-Netflix.Request.Id": generate_request_id(),
         "x-netflix.context.hawkins-version": HAWKINS_VERSION,
         "x-netflix.context.form-factor": FORM_FACTOR,
         "X-Netflix.Request.Attempt": "1",
@@ -616,36 +718,8 @@ def run_ios(wvd_path: Path,
     response.raise_for_status()
     login_html = response.text
 
-    clcs_session_id = None
-    clcs_patterns = [
-        r'"clcsSessionId"\s*:\s*"([0-9a-f\-]{36})"',
-        r'\\"clcsSessionId\\"\s*:\s*\\"([0-9a-f\-]{36})\\"',
-        r'"serverState"\s*:\s*"[^\"]*clcsSessionId\\":\\"([0-9a-f\-]{36})',
-        r'"trackingInfo"\s*:\s*"[^\"]*clcsSessionId\\":\\"([0-9a-f\-]{36})',
-        r'"sessionId"\s*:\s*"([0-9a-f\-]{36})"',
-    ]
-    for pattern in clcs_patterns:
-        match = re.search(pattern, login_html)
-        if match:
-            clcs_session_id = match.group(1)
-            break
-
-    if not clcs_session_id:
-        raise RuntimeError("Could not extract clcsSessionId from the login page HTML")
-
-    rendition_id = None
-    rendition_patterns = [
-        r'"renditionId"\s*:\s*"([0-9a-f\-]{36})"',
-        r'\\"renditionId\\"\s*:\s*\\"([0-9a-f\-]{36})\\"',
-    ]
-    for pattern in rendition_patterns:
-        match = re.search(pattern, login_html)
-        if match:
-            rendition_id = match.group(1)
-            break
-
-    if not rendition_id:
-        raise RuntimeError("Could not extract the initial renditionId from the login page HTML")
+    clcs_session_id = extract_clcs_session_id(login_html)
+    rendition_id = extract_rendition_id(login_html)
 
     log.info("Submitting password screen update")
 
@@ -697,7 +771,7 @@ def run_ios(wvd_path: Path,
             "x-netflix.context.feature-capabilities": FEATURE_CAPABILITIES,
             "x-netflix.context.operation-name": operation_name,
             "X-Netflix.request.expiry.timeout": "15000",
-            "X-Netflix.Request.Id": "".join(random.choice("0123456789abcdef") for _ in range(32)),
+            "X-Netflix.Request.Id": generate_request_id(),
             "x-netflix.context.hawkins-version": HAWKINS_VERSION,
             "x-netflix.context.form-factor": FORM_FACTOR,
             "X-Netflix.Request.Attempt": "1",
@@ -726,10 +800,6 @@ def run_ios(wvd_path: Path,
                                                                application_data=body,
                                                                headers=headers)
 
-        auth_cookies = {}
-        for cookie in session.cookies:
-            auth_cookies[cookie.name] = cookie.value
-
         data = login_response.get("data", {}) if isinstance(login_response, dict) else {}
         result = data.get("result", {}) if isinstance(data, dict) else {}
 
@@ -739,38 +809,7 @@ def run_ios(wvd_path: Path,
         header_data = {}
 
         if encrypted_header_b64:
-            encryption_key_value = msl_client.keys.encryption
-            sign_key_value = msl_client.keys.sign
-
-            if isinstance(encryption_key_value, str):
-                try:
-                    encryption_key = bytes.fromhex(encryption_key_value)
-                except ValueError:
-                    encryption_key = encryption_key_value.encode("utf-8")
-            else:
-                encryption_key = encryption_key_value
-
-            if isinstance(sign_key_value, str):
-                try:
-                    sign_key = bytes.fromhex(sign_key_value)
-                except ValueError:
-                    sign_key = sign_key_value.encode("utf-8")
-            else:
-                sign_key = sign_key_value
-
-            if not encryption_key:
-                raise RuntimeError("The encryption key is missing")
-
-            if not sign_key:
-                raise RuntimeError("The sign key is missing")
-
-            encrypted_header = json.loads(base64.b64decode(encrypted_header_b64))
-            iv = base64.b64decode(encrypted_header["iv"])
-            ciphertext = base64.b64decode(encrypted_header["ciphertext"])
-
-            cipher = AES.new(encryption_key, AES.MODE_CBC, iv)
-            decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
-            header_data = json.loads(decrypted.decode("utf-8"))
+            header_data = decrypt_msl_header(encrypted_header_b64, msl_client.keys.encryption, msl_client.keys.sign)
 
     except Exception:
         log.exception("Failed to process the login response")
@@ -780,13 +819,8 @@ def run_ios(wvd_path: Path,
         log.info("LOGIN SUCCESSFUL")
 
         try:
-            AUTH_COOKIES_PATH.write_text(
-                json.dumps(auth_cookies, indent=2),
-                encoding="utf-8"
-            )
-            log.info("Authentication cookies saved")
+            save_session_cookies(session, AUTH_COOKIES_PATH, log)
         except Exception:
-            log.exception("Failed to save cookies")
             sys.exit(1)
 
     else:
@@ -800,16 +834,9 @@ def run_ios(wvd_path: Path,
 
 def run_tv(wvd_path: Path,
            new_msl: bool = False, no_verify: bool = False):
-    from Crypto.Cipher import AES
-    from Crypto.Util.Padding import unpad
     log = logging.getLogger('ANDROID TV MSL')
 
-
-
-
-    BASE_DIR = Path(__file__).resolve().parent
-    OUTPUT_DIR = BASE_DIR / "output"
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR = ensure_output_dir("tv")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache.json"
     USER_ID_TOKEN_PATH = OUTPUT_DIR / "useridtoken.json"
     MSL_TRACE_PATH = OUTPUT_DIR / "msl_debug_trace.json"
@@ -831,7 +858,7 @@ def run_tv(wvd_path: Path,
     NETJS_VERSION = "3.0.5"
     APK_VERSION = "12.1.9"
     UI_SEM_VER = "44798.0.0"
-    ESN = f"{DEVICE_TYPE}-11233-{''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(64))}"
+    ESN = f"{DEVICE_TYPE}-11233-{generate_esn_random_suffix(64)}"
 
     IMPORTANT_COOKIE_NAMES = (
         "netflix-mfa-nonce",
@@ -887,13 +914,7 @@ def run_tv(wvd_path: Path,
         {"name": "withSize", "value": {"booleanValue": True}},
     ]
 
-    REQUEST_ARGS_DICT: Dict[str, Any] = {}
-    for arg in REQUEST_ARGS:
-        value = arg["value"]
-        if "stringValue" in value:
-            REQUEST_ARGS_DICT[arg["name"]] = value["stringValue"]
-        elif "booleanValue" in value:
-            REQUEST_ARGS_DICT[arg["name"]] = value["booleanValue"]
+    REQUEST_ARGS_DICT = request_args_to_dict(REQUEST_ARGS)
 
     PBO_COMMON = {
         "sdk": SDK_VERSION,
@@ -986,7 +1007,7 @@ def run_tv(wvd_path: Path,
                 "User-Agent": f"Netflix/{SDK_VERSION} (DEVTYPE={DEVICE_TYPE}; Milo=1.0.6315; build_number=6315; build_sha=a1b915de)",
                 "Accept": "*/*",
                 "x-netflix.context.sdk-version": SDK_VERSION,
-                "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+                "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
                 "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
                 "X-Netflix.Request.NonJson.Headers": "true",
                 "x-netflix.client.netjs.version": NETJS_VERSION,
@@ -1045,7 +1066,7 @@ def run_tv(wvd_path: Path,
                 "Accept": "*/*",
                 "Accept-Encoding": "deflate,gzip",
                 "x-netflix.context.sdk-version": SDK_VERSION,
-                "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+                "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
                 "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
                 "X-Gibbon-Cache-Control": "no-cache",
                 "X-Netflix.request.expiry.timeout": "20000",
@@ -1181,56 +1202,14 @@ def run_tv(wvd_path: Path,
             headers=mint_headers,
         )
 
-        payload_type = type(payload).__name__
-        parsed_payload = None
-        text_payload = None
-        if isinstance(payload, dict):
-            payload_type = "msl_payload"
-            parsed_payload = payload
-        elif isinstance(payload, list):
-            payload_type = "json_array"
-            parsed_payload = {"items": payload}
-        elif isinstance(payload, str):
-            cleaned = payload.rstrip("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10")
-            text_payload = cleaned
-            try:
-                maybe_json = json.loads(cleaned)
-                if isinstance(maybe_json, dict):
-                    parsed_payload = maybe_json
-                    payload_type = "text"
-            except Exception:
-                payload_type = "text"
+        payload_type, parsed_payload, text_payload = parse_msl_payload(payload)
 
-        key_id = ""
-        if msl.keys.mastertoken:
-            token_data = json.loads(base64.b64decode(msl.keys.mastertoken["tokendata"]).decode("utf-8"))
-            key_id = str(token_data.get("sequencenumber", "")).encode("utf-8").hex()
+        key_id = extract_key_id_from_mastertoken(msl.keys.mastertoken) if msl.keys.mastertoken else ""
 
-        event: Dict[str, Any] = {
-            "_type": "decrypt",
-            "_mslId": msl.message_id,
-            "_timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            "_keyId": key_id,
-            "_dataType": payload_type,
-        }
-        if text_payload is not None:
-            event["_text"] = text_payload
-        if parsed_payload is not None:
-            event["_payload"] = parsed_payload
+        event = build_msl_trace_event(msl.message_id, key_id, payload_type, parsed_payload, text_payload)
         MSL_TRACE.append(event)
 
-        useridtoken = None
-        stack = [parsed_payload if parsed_payload is not None else payload]
-        while stack:
-            current = stack.pop()
-            if isinstance(current, dict):
-                if useridtoken is None and set(current.keys()) >= {"tokendata", "signature"}:
-                    useridtoken = current
-                for child in current.values():
-                    stack.append(child)
-            elif isinstance(current, list):
-                for item in current:
-                    stack.append(item)
+        useridtoken = extract_useridtoken_from_payload(parsed_payload, payload)
 
         if useridtoken:
             USER_ID_TOKEN_PATH.write_text(json.dumps(useridtoken, indent=2), encoding="utf-8")
@@ -1254,7 +1233,7 @@ def run_tv(wvd_path: Path,
             "Content-Type": "application/json",
             "Connection": "Keep-Alive",
             "x-netflix.context.sdk-version": SDK_VERSION,
-            "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+            "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
             "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
             "X-Gibbon-Cache-Control": "no-cache",
             "x-netflix.request.expiry.timeout": "20000",
@@ -1282,11 +1261,7 @@ def run_tv(wvd_path: Path,
 
     cookie_values: List[str] = []
     headers = dict(session.headers)
-    cookie_header_map: Dict[str, str] = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
@@ -1311,32 +1286,7 @@ def run_tv(wvd_path: Path,
         timeout=30,
     )
 
-    raw_headers = getattr(response.raw, "headers", None)
-    if raw_headers is not None and hasattr(raw_headers, "get_all"):
-        cookie_values.extend(raw_headers.get_all("Set-Cookie") or [])
-    header_value = response.headers.get("Set-Cookie")
-    if header_value and header_value not in cookie_values:
-        cookie_values.append(header_value)
-    for raw_cookie in cookie_values:
-        jar = SimpleCookie()
-        try:
-            jar.load(raw_cookie)
-        except Exception:
-            continue
-        for morsel in jar.values():
-            cookie_domain = morsel["domain"] or None
-            cookie_path = morsel["path"] or "/"
-            if morsel.value == "":
-                try:
-                    session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                except Exception:
-                    pass
-                continue
-            try:
-                session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-            except Exception:
-                pass
-            session.cookies.set(morsel.key, morsel.value, domain=cookie_domain, path=cookie_path, secure=bool(morsel["secure"]))
+    apply_set_cookie_headers(session, response, cookie_values)
 
     response.raise_for_status()
     init_data = response.json()
@@ -1392,7 +1342,7 @@ def run_tv(wvd_path: Path,
 
     # Step 5a: signInAction on welcomeContentLanding
     trace_uuid = str(uuid.uuid4())
-    session.headers["X-Netflix.request.id"] = "".join(random.choice("0123456789ABCDEF") for _ in range(32))
+    session.headers["X-Netflix.request.id"] = generate_hex_id(32, uppercase=True)
     session.headers["X-Netflix.request.toplevel.uuid"] = trace_uuid
     session.headers["X-Netflix.tracing.cl.userActionId"] = trace_uuid
     session.headers["X-Netflix.context.operation-name"] = "clcsLegacyMoneyballSubmit"
@@ -1411,11 +1361,7 @@ def run_tv(wvd_path: Path,
 
     cookie_values = []
     headers = dict(session.headers)
-    cookie_header_map = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
@@ -1440,72 +1386,14 @@ def run_tv(wvd_path: Path,
         timeout=30,
     )
 
-    raw_headers = getattr(response.raw, "headers", None)
-    if raw_headers is not None and hasattr(raw_headers, "get_all"):
-        cookie_values.extend(raw_headers.get_all("Set-Cookie") or [])
-    header_value = response.headers.get("Set-Cookie")
-    if header_value and header_value not in cookie_values:
-        cookie_values.append(header_value)
-    for raw_cookie in cookie_values:
-        jar = SimpleCookie()
-        try:
-            jar.load(raw_cookie)
-        except Exception:
-            continue
-        for morsel in jar.values():
-            cookie_domain = morsel["domain"] or None
-            cookie_path = morsel["path"] or "/"
-            if morsel.value == "":
-                try:
-                    session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                except Exception:
-                    pass
-                continue
-            try:
-                session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-            except Exception:
-                pass
-            session.cookies.set(morsel.key, morsel.value, domain=cookie_domain, path=cookie_path, secure=bool(morsel["secure"]))
+    apply_set_cookie_headers(session, response, cookie_values)
 
     response.raise_for_status()
     submit_data = response.json()
     mfa_nonce = session.cookies.get("netflix-mfa-nonce")
     log.info("netflix-mfa-nonce: %s", (mfa_nonce[:80] + "...") if mfa_nonce else "missing")
 
-    flow_update: Dict[str, str] = {}
-    data = submit_data.get("data", {})
-    operation_key = next(iter(data.keys()), "")
-    inner = data.get(operation_key, {})
-    screen = inner.get("screen", inner) if isinstance(inner, dict) else {}
-    stack = [screen]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            tracking_info = value.get("trackingInfo")
-            if isinstance(tracking_info, str) and tracking_info:
-                try:
-                    tracking = json.loads(tracking_info)
-                except Exception:
-                    tracking = {}
-                if tracking.get("clcsSessionId") and not flow_update.get("clcsSessionId"):
-                    flow_update["clcsSessionId"] = tracking.get("clcsSessionId", "")
-                if tracking.get("clcsRenditionId"):
-                    flow_update["renditionId"] = tracking.get("clcsRenditionId", "")
-            payload_json = value.get("payloadJson")
-            if isinstance(payload_json, str) and payload_json:
-                try:
-                    payload = json.loads(payload_json)
-                except Exception:
-                    payload = {}
-                if payload.get("flwssn") and not flow_update.get("flowSessionId"):
-                    flow_update["flowSessionId"] = payload.get("flwssn", "")
-                if payload.get("mode"):
-                    flow_update["mode"] = payload.get("mode", "")
-            for child in value.values():
-                stack.append(child)
-        elif isinstance(value, list):
-            for item in value:
-                stack.append(item)
+    flow_update = parse_flow_data(submit_data)
 
     flow_session_id = flow_update.get("flowSessionId", flow_session_id)
     clcs_session_id = flow_update.get("clcsSessionId", clcs_session_id)
@@ -1513,7 +1401,7 @@ def run_tv(wvd_path: Path,
 
     # Step 5b: lrudSignInAction on webSignIn
     trace_uuid = str(uuid.uuid4())
-    session.headers["X-Netflix.request.id"] = "".join(random.choice("0123456789ABCDEF") for _ in range(32))
+    session.headers["X-Netflix.request.id"] = generate_hex_id(32, uppercase=True)
     session.headers["X-Netflix.request.toplevel.uuid"] = trace_uuid
     session.headers["X-Netflix.tracing.cl.userActionId"] = trace_uuid
     session.headers["X-Netflix.context.operation-name"] = "clcsScreenUpdate"
@@ -1532,11 +1420,7 @@ def run_tv(wvd_path: Path,
 
     cookie_values = []
     headers = dict(session.headers)
-    cookie_header_map = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
@@ -1568,40 +1452,7 @@ def run_tv(wvd_path: Path,
     response.raise_for_status()
     step_web_signin = response.json()
 
-    flow_update = {}
-    data = step_web_signin.get("data", {})
-    operation_key = next(iter(data.keys()), "")
-    inner = data.get(operation_key, {})
-    screen = inner.get("screen", inner) if isinstance(inner, dict) else {}
-    stack = [screen]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            tracking_info = value.get("trackingInfo")
-            if isinstance(tracking_info, str) and tracking_info:
-                try:
-                    tracking = json.loads(tracking_info)
-                except Exception:
-                    tracking = {}
-                if tracking.get("clcsSessionId") and not flow_update.get("clcsSessionId"):
-                    flow_update["clcsSessionId"] = tracking.get("clcsSessionId", "")
-                if tracking.get("clcsRenditionId"):
-                    flow_update["renditionId"] = tracking.get("clcsRenditionId", "")
-            payload_json = value.get("payloadJson")
-            if isinstance(payload_json, str) and payload_json:
-                try:
-                    payload = json.loads(payload_json)
-                except Exception:
-                    payload = {}
-                if payload.get("flwssn") and not flow_update.get("flowSessionId"):
-                    flow_update["flowSessionId"] = payload.get("flwssn", "")
-                if payload.get("mode"):
-                    flow_update["mode"] = payload.get("mode", "")
-            for child in value.values():
-                stack.append(child)
-        elif isinstance(value, list):
-            for item in value:
-                stack.append(item)
+    flow_update = parse_flow_data(step_web_signin)
 
     flow_session_id = flow_update.get("flowSessionId", flow_session_id)
     clcs_session_id = flow_update.get("clcsSessionId", clcs_session_id)
@@ -1609,7 +1460,7 @@ def run_tv(wvd_path: Path,
 
     # Step 5c: submitUserIdAction on enterMemberCredentials
     trace_uuid = str(uuid.uuid4())
-    session.headers["X-Netflix.request.id"] = "".join(random.choice("0123456789ABCDEF") for _ in range(32))
+    session.headers["X-Netflix.request.id"] = generate_hex_id(32, uppercase=True)
     session.headers["X-Netflix.request.toplevel.uuid"] = trace_uuid
     session.headers["X-Netflix.tracing.cl.userActionId"] = trace_uuid
     session.headers["X-Netflix.context.operation-name"] = "clcsScreenUpdate"
@@ -1628,11 +1479,7 @@ def run_tv(wvd_path: Path,
 
     cookie_values = []
     headers = dict(session.headers)
-    cookie_header_map = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
@@ -1666,40 +1513,7 @@ def run_tv(wvd_path: Path,
     response.raise_for_status()
     step_user = response.json()
 
-    flow_update = {}
-    data = step_user.get("data", {})
-    operation_key = next(iter(data.keys()), "")
-    inner = data.get(operation_key, {})
-    screen = inner.get("screen", inner) if isinstance(inner, dict) else {}
-    stack = [screen]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            tracking_info = value.get("trackingInfo")
-            if isinstance(tracking_info, str) and tracking_info:
-                try:
-                    tracking = json.loads(tracking_info)
-                except Exception:
-                    tracking = {}
-                if tracking.get("clcsSessionId") and not flow_update.get("clcsSessionId"):
-                    flow_update["clcsSessionId"] = tracking.get("clcsSessionId", "")
-                if tracking.get("clcsRenditionId"):
-                    flow_update["renditionId"] = tracking.get("clcsRenditionId", "")
-            payload_json = value.get("payloadJson")
-            if isinstance(payload_json, str) and payload_json:
-                try:
-                    payload = json.loads(payload_json)
-                except Exception:
-                    payload = {}
-                if payload.get("flwssn") and not flow_update.get("flowSessionId"):
-                    flow_update["flowSessionId"] = payload.get("flwssn", "")
-                if payload.get("mode"):
-                    flow_update["mode"] = payload.get("mode", "")
-            for child in value.values():
-                stack.append(child)
-        elif isinstance(value, list):
-            for item in value:
-                stack.append(item)
+    flow_update = parse_flow_data(step_user)
 
     flow_session_id = flow_update.get("flowSessionId", flow_session_id)
     clcs_session_id = flow_update.get("clcsSessionId", clcs_session_id)
@@ -1707,7 +1521,7 @@ def run_tv(wvd_path: Path,
 
     # Step 5d: usePasswordAction on loginLinkOption
     trace_uuid = str(uuid.uuid4())
-    session.headers["X-Netflix.request.id"] = "".join(random.choice("0123456789ABCDEF") for _ in range(32))
+    session.headers["X-Netflix.request.id"] = generate_hex_id(32, uppercase=True)
     session.headers["X-Netflix.request.toplevel.uuid"] = trace_uuid
     session.headers["X-Netflix.tracing.cl.userActionId"] = trace_uuid
     session.headers["X-Netflix.context.operation-name"] = "clcsScreenUpdate"
@@ -1726,11 +1540,7 @@ def run_tv(wvd_path: Path,
 
     cookie_values = []
     headers = dict(session.headers)
-    cookie_header_map = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
@@ -1763,40 +1573,7 @@ def run_tv(wvd_path: Path,
     response.raise_for_status()
     step_password_path = response.json()
 
-    flow_update = {}
-    data = step_password_path.get("data", {})
-    operation_key = next(iter(data.keys()), "")
-    inner = data.get(operation_key, {})
-    screen = inner.get("screen", inner) if isinstance(inner, dict) else {}
-    stack = [screen]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            tracking_info = value.get("trackingInfo")
-            if isinstance(tracking_info, str) and tracking_info:
-                try:
-                    tracking = json.loads(tracking_info)
-                except Exception:
-                    tracking = {}
-                if tracking.get("clcsSessionId") and not flow_update.get("clcsSessionId"):
-                    flow_update["clcsSessionId"] = tracking.get("clcsSessionId", "")
-                if tracking.get("clcsRenditionId"):
-                    flow_update["renditionId"] = tracking.get("clcsRenditionId", "")
-            payload_json = value.get("payloadJson")
-            if isinstance(payload_json, str) and payload_json:
-                try:
-                    payload = json.loads(payload_json)
-                except Exception:
-                    payload = {}
-                if payload.get("flwssn") and not flow_update.get("flowSessionId"):
-                    flow_update["flowSessionId"] = payload.get("flwssn", "")
-                if payload.get("mode"):
-                    flow_update["mode"] = payload.get("mode", "")
-            for child in value.values():
-                stack.append(child)
-        elif isinstance(value, list):
-            for item in value:
-                stack.append(item)
+    flow_update = parse_flow_data(step_password_path)
 
     flow_session_id = flow_update.get("flowSessionId", flow_session_id)
     clcs_session_id = flow_update.get("clcsSessionId", clcs_session_id)
@@ -1806,7 +1583,7 @@ def run_tv(wvd_path: Path,
 
     log.info("Submit email and password")
     trace_uuid = str(uuid.uuid4())
-    session.headers["X-Netflix.request.id"] = "".join(random.choice("0123456789ABCDEF") for _ in range(32))
+    session.headers["X-Netflix.request.id"] = generate_hex_id(32, uppercase=True)
     session.headers["X-Netflix.request.toplevel.uuid"] = trace_uuid
     session.headers["X-Netflix.tracing.cl.userActionId"] = trace_uuid
     session.headers["X-Netflix.context.operation-name"] = "clcsScreenUpdate"
@@ -1825,11 +1602,7 @@ def run_tv(wvd_path: Path,
 
     cookie_values = []
     headers = dict(session.headers)
-    cookie_header_map = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
@@ -1862,73 +1635,13 @@ def run_tv(wvd_path: Path,
         timeout=30,
     )
 
-    raw_headers = getattr(response.raw, "headers", None)
-    if raw_headers is not None and hasattr(raw_headers, "get_all"):
-        cookie_values.extend(raw_headers.get_all("Set-Cookie") or [])
-    header_value = response.headers.get("Set-Cookie")
-    if header_value and header_value not in cookie_values:
-        cookie_values.append(header_value)
-    for raw_cookie in cookie_values:
-        jar = SimpleCookie()
-        try:
-            jar.load(raw_cookie)
-        except Exception:
-            continue
-        for morsel in jar.values():
-            cookie_domain = morsel["domain"] or None
-            cookie_path = morsel["path"] or "/"
-            if morsel.value == "":
-                try:
-                    session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                except Exception:
-                    pass
-                continue
-            try:
-                session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-            except Exception:
-                pass
-            session.cookies.set(morsel.key, morsel.value, domain=cookie_domain, path=cookie_path, secure=bool(morsel["secure"]))
+    apply_set_cookie_headers(session, response, cookie_values)
 
     response.raise_for_status()
     login_data = response.json()
     LOGIN_RESPONSE_PATH.write_text(json.dumps(login_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    flow_result: Dict[str, str] = {}
-    data = login_data.get("data", {})
-    operation_key = next(iter(data.keys()), "")
-    inner = data.get(operation_key, {})
-    screen = inner.get("screen", inner) if isinstance(inner, dict) else {}
-    stack = [screen]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            tracking_info = value.get("trackingInfo")
-            if isinstance(tracking_info, str) and tracking_info:
-                try:
-                    tracking = json.loads(tracking_info)
-                except Exception:
-                    tracking = {}
-                if tracking.get("clcsSessionId") and not flow_result.get("clcsSessionId"):
-                    flow_result["clcsSessionId"] = tracking.get("clcsSessionId", "")
-                if tracking.get("clcsRenditionId"):
-                    flow_result["renditionId"] = tracking.get("clcsRenditionId", "")
-            payload_json = value.get("payloadJson")
-            if isinstance(payload_json, str) and payload_json:
-                try:
-                    payload = json.loads(payload_json)
-                except Exception:
-                    payload = {}
-                if payload.get("flwssn") and not flow_result.get("flowSessionId"):
-                    flow_result["flowSessionId"] = payload.get("flwssn", "")
-                if payload.get("mode"):
-                    flow_result["mode"] = payload.get("mode", "")
-            if value.get("membershipStatus"):
-                flow_result["membershipStatus"] = value.get("membershipStatus", "")
-            for child in value.values():
-                stack.append(child)
-        elif isinstance(value, list):
-            for item in value:
-                stack.append(item)
+    flow_result = parse_flow_data(login_data)
 
     membership = flow_result.get("membershipStatus", "")
     flow_session_id = flow_result.get("flowSessionId", flow_session_id)
@@ -1949,7 +1662,7 @@ def run_tv(wvd_path: Path,
             "Content-Type": "application/json",
             "Connection": "Keep-Alive",
             "x-netflix.context.sdk-version": SDK_VERSION,
-            "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+            "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
             "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"browseTitles","appstate":"foreground","reason":"unknown"}',
             "X-Gibbon-Cache-Control": "no-cache",
             "x-netflix.request.expiry.timeout": "20000",
@@ -1977,11 +1690,7 @@ def run_tv(wvd_path: Path,
 
     cookie_values = []
     headers = dict(session.headers)
-    cookie_header_map = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
@@ -2006,32 +1715,7 @@ def run_tv(wvd_path: Path,
         timeout=30,
     )
 
-    raw_headers = getattr(response.raw, "headers", None)
-    if raw_headers is not None and hasattr(raw_headers, "get_all"):
-        cookie_values.extend(raw_headers.get_all("Set-Cookie") or [])
-    header_value = response.headers.get("Set-Cookie")
-    if header_value and header_value not in cookie_values:
-        cookie_values.append(header_value)
-    for raw_cookie in cookie_values:
-        jar = SimpleCookie()
-        try:
-            jar.load(raw_cookie)
-        except Exception:
-            continue
-        for morsel in jar.values():
-            cookie_domain = morsel["domain"] or None
-            cookie_path = morsel["path"] or "/"
-            if morsel.value == "":
-                try:
-                    session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                except Exception:
-                    pass
-                continue
-            try:
-                session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-            except Exception:
-                pass
-            session.cookies.set(morsel.key, morsel.value, domain=cookie_domain, path=cookie_path, secure=bool(morsel["secure"]))
+    apply_set_cookie_headers(session, response, cookie_values)
 
     response.raise_for_status()
     gsid = session.cookies.get("gsid")
@@ -2126,46 +1810,14 @@ def run_tv(wvd_path: Path,
                     headers=optional_headers,
                 )
 
-                payload_type = type(payload).__name__
-                parsed_payload = None
-                text_payload = None
-                if isinstance(payload, dict):
-                    payload_type = "msl_payload"
-                    parsed_payload = payload
-                elif isinstance(payload, list):
-                    payload_type = "json_array"
-                    parsed_payload = {"items": payload}
-                elif isinstance(payload, str):
-                    cleaned = payload.rstrip("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10")
-                    text_payload = cleaned
-                    try:
-                        maybe_json = json.loads(cleaned)
-                        if isinstance(maybe_json, dict):
-                            parsed_payload = maybe_json
-                            payload_type = "text"
-                    except Exception:
-                        payload_type = "text"
+                payload_type, parsed_payload, text_payload = parse_msl_payload(payload)
 
-                event = {
-                    "_type": "decrypt",
-                    "_mslId": msl.message_id,
-                    "_timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-                    "_dataType": payload_type,
-                }
-                if text_payload is not None:
-                    event["_text"] = text_payload
-                if parsed_payload is not None:
-                    event["_payload"] = parsed_payload
+                event = build_msl_trace_event(msl.message_id, "", payload_type, parsed_payload, text_payload)
                 MSL_TRACE.append(event)
 
                 if isinstance(header, dict) and "headerdata" in header:
                     try:
-                        encrypted_header = json.loads(base64.b64decode(header["headerdata"]))
-                        iv = base64.b64decode(encrypted_header["iv"])
-                        ciphertext = base64.b64decode(encrypted_header["ciphertext"])
-                        cipher = AES.new(msl.keys.encryption, AES.MODE_CBC, iv)
-                        decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
-                        header_data = json.loads(decrypted.decode("utf-8"))
+                        header_data = decrypt_msl_header(header["headerdata"], msl.keys.encryption, msl.keys.sign)
                         tokens = header_data.get("useridtoken")
                         if tokens:
                             USER_ID_TOKEN_PATH.write_text(json.dumps(tokens, indent=2), encoding="utf-8")
@@ -2176,25 +1828,7 @@ def run_tv(wvd_path: Path,
             log.warning("Post-login MSL refresh failed: %s", exc)
 
     log.info("Save filtered cookies")
-    preferred: Dict[str, Any] = {}
-    for cookie in session.cookies:
-        if cookie.name not in IMPORTANT_COOKIE_NAMES:
-            continue
-        current = preferred.get(cookie.name)
-        score = (cookie.domain == ".netflix.com", cookie.path == "/", bool(cookie.value))
-        if current is None or score >= current[0]:
-            preferred[cookie.name] = (score, cookie)
-
-    for cookie in list(session.cookies):
-        winner = preferred.get(cookie.name)
-        if not winner:
-            continue
-        winner_cookie = winner[1]
-        if (cookie.domain, cookie.path, cookie.value) != (winner_cookie.domain, winner_cookie.path, winner_cookie.value):
-            try:
-                session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
-            except Exception:
-                pass
+    dedupe_important_cookies(session, IMPORTANT_COOKIE_NAMES)
 
     cookies: Dict[str, str] = {}
     for cookie in session.cookies:
@@ -2243,13 +1877,7 @@ def run_tv(wvd_path: Path,
 def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
     log = logging.getLogger('ANDROID TV MSL')
 
-
-    from typing import Any, Dict, List
-
-
-    BASE_DIR = Path(__file__).resolve().parent
-    OUTPUT_DIR = BASE_DIR / "output"
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR = ensure_output_dir()
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache.json"
     USER_ID_TOKEN_PATH = OUTPUT_DIR / "useridtoken.json"
     NETFLIX_COOKIES_PATH = OUTPUT_DIR / "netflix_cookies.json"
@@ -2263,7 +1891,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
     DEVICE_NAME = "SHIELD"
     ANDROID_BUILD_FINGERPRINT = "12.1.9-23083 R 2025.2 android-30-JPLAYER2 ninja_6==NVIDIA/mdarcy/mdarcy:11/RQ1A.210105.003/7825230_4040.2147:user/release-keys"
     APP_VERSION = "UI-release-20260408_44798-gibbon-r100-aui-nrdjs=v3.12.55"
-    ESN = f"NFANDROID2-PRV-NVIDIASHIELDANDROIDTV2019-NVIDISHIELD=ANDROID=TV-11233-{''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(64))}"
+    ESN = f"NFANDROID2-PRV-NVIDIASHIELDANDROIDTV2019-NVIDISHIELD=ANDROID=TV-11233-{generate_esn_random_suffix(64)}"
 
     IMPORTANT_COOKIE_NAMES = ("netflix-mfa-nonce", "NetflixId", "SecureNetflixId", "nfvdid", "gsid")
 
@@ -2428,7 +2056,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
                 "User-Agent": ua,
                 "Accept": "*/*",
                 "x-netflix.context.sdk-version": "2025.2.3.0",
-                "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+                "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
                 "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
                 "X-Netflix.Request.NonJson.Headers": "true",
                 "x-netflix.client.netjs.version": "3.0.5",
@@ -2494,7 +2122,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
                 "Accept": "*/*",
                 "Accept-Encoding": "deflate,gzip",
                 "x-netflix.context.sdk-version": "2025.2.3.0",
-                "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+                "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
                 "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
                 "X-Gibbon-Cache-Control": "no-cache",
                 "X-Netflix.request.expiry.timeout": "20000",
@@ -2622,67 +2250,16 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
             headers=mint_headers,
         )
 
-        payload_type = type(payload).__name__
-        parsed_payload = None
-        text_payload = None
+        payload_type, parsed_payload, text_payload = parse_msl_payload(payload)
 
-        if isinstance(payload, dict):
-            payload_type = "msl_payload"
-            parsed_payload = payload
-        elif isinstance(payload, list):
-            payload_type = "json_array"
-            parsed_payload = {"items": payload}
-        elif isinstance(payload, str):
-            cleaned = payload.rstrip("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10")
-            try:
-                maybe_json = json.loads(cleaned)
-            except Exception:
-                maybe_json = cleaned
-            text_payload = cleaned
-            if isinstance(maybe_json, dict):
-                parsed_payload = maybe_json
-                payload_type = "text"
-            else:
-                payload_type = "text"
+        key_id = extract_key_id_from_mastertoken(msl.keys.mastertoken) if msl.keys.mastertoken else ""
 
-        key_id = ""
-        if msl.keys.mastertoken:
-            token_data = json.loads(base64.b64decode(msl.keys.mastertoken["tokendata"]).decode("utf-8"))
-            sequence_number = str(token_data.get("sequencenumber", ""))
-            key_id = sequence_number.encode("utf-8").hex()
+        event = build_msl_trace_event(
+            msl.message_id, key_id, payload_type, parsed_payload, text_payload,
+            extra_fields={"_iv": None, "_ciphertextLen": None, "_plaintextLen": len(text_payload.encode("utf-8")) if isinstance(text_payload, str) else None},
+        )
 
-        event: Dict[str, Any] = {
-            "_type": "decrypt",
-            "_mslId": msl.message_id,
-            "_timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            "_keyId": key_id,
-            "_iv": None,
-            "_ciphertextLen": None,
-            "_plaintextLen": len(text_payload.encode("utf-8")) if isinstance(text_payload, str) else None,
-            "_dataType": payload_type,
-        }
-        if text_payload is not None:
-            event["_text"] = text_payload
-        if parsed_payload is not None:
-            event["_payload"] = parsed_payload
-
-        useridtoken = None
-        servicetokens: List[Dict[str, Any]] = []
-        stack = [parsed_payload if parsed_payload is not None else payload]
-
-        while stack:
-            current = stack.pop()
-            if isinstance(current, dict):
-                if set(current.keys()) >= {"tokendata", "signature"}:
-                    if useridtoken is None:
-                        useridtoken = current
-                    else:
-                        servicetokens.append(current)
-                for child in current.values():
-                    stack.append(child)
-            elif isinstance(current, list):
-                for item in current:
-                    stack.append(item)
+        useridtoken = extract_useridtoken_from_payload(parsed_payload, payload)
 
         if useridtoken:
             USER_ID_TOKEN_PATH.write_text(json.dumps(useridtoken, indent=2), encoding="utf-8")
@@ -2752,7 +2329,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
                     "Accept": "*/*",
                     "Accept-Encoding": "deflate,gzip",
                     "x-netflix.context.sdk-version": "2025.2.3.0",
-                    "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+                    "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
                     "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
                     "X-Gibbon-Cache-Control": "no-cache",
                     "X-Netflix.request.expiry.timeout": "20000",
@@ -2852,67 +2429,16 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
                     headers=optional_headers,
                 )
 
-                payload_type = type(payload).__name__
-                parsed_payload = None
-                text_payload = None
+                payload_type, parsed_payload, text_payload = parse_msl_payload(payload)
 
-                if isinstance(payload, dict):
-                    payload_type = "msl_payload"
-                    parsed_payload = payload
-                elif isinstance(payload, list):
-                    payload_type = "json_array"
-                    parsed_payload = {"items": payload}
-                elif isinstance(payload, str):
-                    cleaned = payload.rstrip("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10")
-                    try:
-                        maybe_json = json.loads(cleaned)
-                    except Exception:
-                        maybe_json = cleaned
-                    text_payload = cleaned
-                    if isinstance(maybe_json, dict):
-                        parsed_payload = maybe_json
-                        payload_type = "text"
-                    else:
-                        payload_type = "text"
+                key_id = extract_key_id_from_mastertoken(msl.keys.mastertoken) if msl.keys.mastertoken else ""
 
-                key_id = ""
-                if msl.keys.mastertoken:
-                    token_data = json.loads(base64.b64decode(msl.keys.mastertoken["tokendata"]).decode("utf-8"))
-                    sequence_number = str(token_data.get("sequencenumber", ""))
-                    key_id = sequence_number.encode("utf-8").hex()
+                event = build_msl_trace_event(
+                    msl.message_id, key_id, payload_type, parsed_payload, text_payload,
+                    extra_fields={"_iv": None, "_ciphertextLen": None, "_plaintextLen": len(text_payload.encode("utf-8")) if isinstance(text_payload, str) else None},
+                )
 
-                event = {
-                    "_type": "decrypt",
-                    "_mslId": msl.message_id,
-                    "_timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-                    "_keyId": key_id,
-                    "_iv": None,
-                    "_ciphertextLen": None,
-                    "_plaintextLen": len(text_payload.encode("utf-8")) if isinstance(text_payload, str) else None,
-                    "_dataType": payload_type,
-                }
-                if text_payload is not None:
-                    event["_text"] = text_payload
-                if parsed_payload is not None:
-                    event["_payload"] = parsed_payload
-
-                useridtoken = None
-                servicetokens = []
-                stack = [parsed_payload if parsed_payload is not None else payload]
-
-                while stack:
-                    current = stack.pop()
-                    if isinstance(current, dict):
-                        if set(current.keys()) >= {"tokendata", "signature"}:
-                            if useridtoken is None:
-                                useridtoken = current
-                            else:
-                                servicetokens.append(current)
-                        for child in current.values():
-                            stack.append(child)
-                    elif isinstance(current, list):
-                        for item in current:
-                            stack.append(item)
+                useridtoken = extract_useridtoken_from_payload(parsed_payload, payload)
 
                 if useridtoken:
                     USER_ID_TOKEN_PATH.write_text(json.dumps(useridtoken, indent=2), encoding="utf-8")
@@ -2940,7 +2466,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
             "Content-Type": "application/json",
             "Connection": "Keep-Alive",
             "x-netflix.context.sdk-version": "2025.2.3.0",
-            "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+            "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
             "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
             "X-Gibbon-Cache-Control": "no-cache",
             "x-netflix.request.expiry.timeout": "20000",
@@ -2988,109 +2514,23 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
             "supportedVideoFormat": "mp4",
         },
     }
-    cookie_header_map: Dict[str, str] = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     headers = dict(session.headers)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
     response = session.post(graphql_url, json=body, headers=headers, timeout=30)
 
-    raw_headers = getattr(response.raw, "headers", None)
-    if raw_headers is not None and hasattr(raw_headers, "get_all"):
-        cookie_values.extend(raw_headers.get_all("Set-Cookie") or [])
-    header_value = response.headers.get("Set-Cookie")
-    if header_value and header_value not in cookie_values:
-        cookie_values.append(header_value)
+    apply_set_cookie_headers(session, response, cookie_values)
 
-    for raw_cookie in cookie_values:
-        jar = SimpleCookie()
-        try:
-            jar.load(raw_cookie)
-        except Exception:
-            continue
-        for morsel in jar.values():
-            cookie_domain = morsel["domain"] or None
-            cookie_path = morsel["path"] or "/"
-            if morsel.value == "":
-                try:
-                    session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                except Exception:
-                    pass
-                continue
-            try:
-                session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-            except Exception:
-                pass
-            session.cookies.set(morsel.key, morsel.value, domain=cookie_domain, path=cookie_path, secure=bool(morsel["secure"]))
-
-    preferred: Dict[str, Any] = {}
-    for cookie in session.cookies:
-        if cookie.name not in IMPORTANT_COOKIE_NAMES:
-            continue
-        current = preferred.get(cookie.name)
-        score = (cookie.domain == ".netflix.com", cookie.path == "/", bool(cookie.value))
-        if current is None or score >= current[0]:
-            preferred[cookie.name] = (score, cookie)
-
-    for cookie in list(session.cookies):
-        winner = preferred.get(cookie.name)
-        if not winner:
-            continue
-        winner_cookie = winner[1]
-        if (cookie.domain, cookie.path, cookie.value) != (winner_cookie.domain, winner_cookie.path, winner_cookie.value):
-            try:
-                session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
-            except Exception:
-                pass
+    dedupe_important_cookies(session, IMPORTANT_COOKIE_NAMES)
 
     response.raise_for_status()
     init_data = response.json()
     if "errors" in init_data:
         raise RuntimeError(json.dumps(init_data["errors"], indent=2))
 
-    flow: Dict[str, str] = {}
-    data = init_data.get("data", {})
-    operation_key = next(iter(data.keys()), "")
-    inner = data.get(operation_key, {})
-    screen = inner.get("screen", inner) if isinstance(inner, dict) else {}
-
-    stack = [screen]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            tracking_info = value.get("trackingInfo")
-            if isinstance(tracking_info, str) and tracking_info:
-                try:
-                    tracking = json.loads(tracking_info)
-                except Exception:
-                    tracking = {}
-                if tracking.get("clcsSessionId") and not flow.get("clcsSessionId"):
-                    flow["clcsSessionId"] = tracking.get("clcsSessionId", "")
-                if tracking.get("clcsRenditionId"):
-                    flow["renditionId"] = tracking.get("clcsRenditionId", "")
-            payload_json = value.get("payloadJson")
-            if isinstance(payload_json, str) and payload_json:
-                try:
-                    payload = json.loads(payload_json)
-                except Exception:
-                    payload = {}
-                if payload.get("flwssn") and not flow.get("flowSessionId"):
-                    flow["flowSessionId"] = payload.get("flwssn", "")
-                if payload.get("mode"):
-                    flow["mode"] = payload.get("mode", "")
-                if payload.get("flow"):
-                    flow["flow"] = payload.get("flow", "")
-            if value.get("membershipStatus"):
-                flow["membershipStatus"] = value.get("membershipStatus", "")
-            for child in value.values():
-                stack.append(child)
-        elif isinstance(value, list):
-            for item in value:
-                stack.append(item)
+    flow = parse_flow_data(init_data)
 
     flow_session_id = flow.get("flowSessionId", "")
     clcs_session_id = flow.get("clcsSessionId", "")
@@ -3116,7 +2556,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
             "Content-Type": "application/json",
             "Connection": "Keep-Alive",
             "x-netflix.context.sdk-version": "2025.2.3.0",
-            "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+            "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
             "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
             "X-Gibbon-Cache-Control": "no-cache",
             "x-netflix.request.expiry.timeout": "20000",
@@ -3142,13 +2582,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
         }
     )
 
-    request_args_dict: Dict[str, Any] = {}
-    for arg in REQUEST_ARGS:
-        value = arg["value"]
-        if "stringValue" in value:
-            request_args_dict[arg["name"]] = value["stringValue"]
-        elif "booleanValue" in value:
-            request_args_dict[arg["name"]] = value["booleanValue"]
+    request_args_dict = request_args_to_dict(REQUEST_ARGS)
 
     server_state = json.dumps(
         {
@@ -3184,107 +2618,21 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
             "serverState": server_state,
         },
     }
-    cookie_header_map = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     headers = dict(session.headers)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
     response = session.post(graphql_url, json=body, headers=headers, timeout=30)
 
-    raw_headers = getattr(response.raw, "headers", None)
-    if raw_headers is not None and hasattr(raw_headers, "get_all"):
-        cookie_values.extend(raw_headers.get_all("Set-Cookie") or [])
-    header_value = response.headers.get("Set-Cookie")
-    if header_value and header_value not in cookie_values:
-        cookie_values.append(header_value)
+    apply_set_cookie_headers(session, response, cookie_values)
 
-    for raw_cookie in cookie_values:
-        jar = SimpleCookie()
-        try:
-            jar.load(raw_cookie)
-        except Exception:
-            continue
-        for morsel in jar.values():
-            cookie_domain = morsel["domain"] or None
-            cookie_path = morsel["path"] or "/"
-            if morsel.value == "":
-                try:
-                    session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                except Exception:
-                    pass
-                continue
-            try:
-                session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-            except Exception:
-                pass
-            session.cookies.set(morsel.key, morsel.value, domain=cookie_domain, path=cookie_path, secure=bool(morsel["secure"]))
-
-    preferred = {}
-    for cookie in session.cookies:
-        if cookie.name not in IMPORTANT_COOKIE_NAMES:
-            continue
-        current = preferred.get(cookie.name)
-        score = (cookie.domain == ".netflix.com", cookie.path == "/", bool(cookie.value))
-        if current is None or score >= current[0]:
-            preferred[cookie.name] = (score, cookie)
-
-    for cookie in list(session.cookies):
-        winner = preferred.get(cookie.name)
-        if not winner:
-            continue
-        winner_cookie = winner[1]
-        if (cookie.domain, cookie.path, cookie.value) != (winner_cookie.domain, winner_cookie.path, winner_cookie.value):
-            try:
-                session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
-            except Exception:
-                pass
+    dedupe_important_cookies(session, IMPORTANT_COOKIE_NAMES)
 
     response.raise_for_status()
     submit_data = response.json()
 
-    flow2: Dict[str, str] = {}
-    data = submit_data.get("data", {})
-    operation_key = next(iter(data.keys()), "")
-    inner = data.get(operation_key, {})
-    screen = inner.get("screen", inner) if isinstance(inner, dict) else {}
-
-    stack = [screen]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            tracking_info = value.get("trackingInfo")
-            if isinstance(tracking_info, str) and tracking_info:
-                try:
-                    tracking = json.loads(tracking_info)
-                except Exception:
-                    tracking = {}
-                if tracking.get("clcsSessionId") and not flow2.get("clcsSessionId"):
-                    flow2["clcsSessionId"] = tracking.get("clcsSessionId", "")
-                if tracking.get("clcsRenditionId"):
-                    flow2["renditionId"] = tracking.get("clcsRenditionId", "")
-            payload_json = value.get("payloadJson")
-            if isinstance(payload_json, str) and payload_json:
-                try:
-                    payload = json.loads(payload_json)
-                except Exception:
-                    payload = {}
-                if payload.get("flwssn") and not flow2.get("flowSessionId"):
-                    flow2["flowSessionId"] = payload.get("flwssn", "")
-                if payload.get("mode"):
-                    flow2["mode"] = payload.get("mode", "")
-                if payload.get("flow"):
-                    flow2["flow"] = payload.get("flow", "")
-            if value.get("membershipStatus"):
-                flow2["membershipStatus"] = value.get("membershipStatus", "")
-            for child in value.values():
-                stack.append(child)
-        elif isinstance(value, list):
-            for item in value:
-                stack.append(item)
+    flow2 = parse_flow_data(submit_data)
 
     rendition_id = flow2.get("renditionId", rendition_id)
     log.info("Rendition: %s", rendition_id)
@@ -3339,7 +2687,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
                 "Content-Type": "application/json",
                 "Connection": "Keep-Alive",
                 "x-netflix.context.sdk-version": "2025.2.3.0",
-                "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+                "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
                 "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
                 "X-Gibbon-Cache-Control": "no-cache",
                 "x-netflix.request.expiry.timeout": "20000",
@@ -3402,64 +2750,15 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
                 "serverState": server_state,
             },
         }
-        cookie_header_map = {}
-        for cookie in session.cookies:
-            if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-                cookie_header_map[cookie.name] = cookie.value
-        cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+        cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
         headers = dict(session.headers)
         if cookie_header:
             headers["Cookie"] = cookie_header
 
         response = session.post(graphql_url, json=body, headers=headers, timeout=30)
 
-        raw_headers = getattr(response.raw, "headers", None)
-        if raw_headers is not None and hasattr(raw_headers, "get_all"):
-            cookie_values.extend(raw_headers.get_all("Set-Cookie") or [])
-        header_value = response.headers.get("Set-Cookie")
-        if header_value and header_value not in cookie_values:
-            cookie_values.append(header_value)
-
-        for raw_cookie in cookie_values:
-            jar = SimpleCookie()
-            try:
-                jar.load(raw_cookie)
-            except Exception:
-                continue
-            for morsel in jar.values():
-                cookie_domain = morsel["domain"] or None
-                cookie_path = morsel["path"] or "/"
-                if morsel.value == "":
-                    try:
-                        session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                    except Exception:
-                        pass
-                    continue
-                try:
-                    session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                except Exception:
-                    pass
-                session.cookies.set(morsel.key, morsel.value, domain=cookie_domain, path=cookie_path, secure=bool(morsel["secure"]))
-
-        preferred = {}
-        for cookie in session.cookies:
-            if cookie.name not in IMPORTANT_COOKIE_NAMES:
-                continue
-            current = preferred.get(cookie.name)
-            score = (cookie.domain == ".netflix.com", cookie.path == "/", bool(cookie.value))
-            if current is None or score >= current[0]:
-                preferred[cookie.name] = (score, cookie)
-
-        for cookie in list(session.cookies):
-            winner = preferred.get(cookie.name)
-            if not winner:
-                continue
-            winner_cookie = winner[1]
-            if (cookie.domain, cookie.path, cookie.value) != (winner_cookie.domain, winner_cookie.path, winner_cookie.value):
-                try:
-                    session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
-                except Exception:
-                    pass
+        apply_set_cookie_headers(session, response, cookie_values)
+        dedupe_important_cookies(session, IMPORTANT_COOKIE_NAMES)
 
         response.raise_for_status()
         poll_data = response.json()
@@ -3514,7 +2813,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
             "Content-Type": "application/json",
             "Connection": "Keep-Alive",
             "x-netflix.context.sdk-version": "2025.2.3.0",
-            "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+            "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
             "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
             "X-Gibbon-Cache-Control": "no-cache",
             "x-netflix.request.expiry.timeout": "20000",
@@ -3579,107 +2878,21 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
             "serverState": server_state,
         },
     }
-    cookie_header_map = {}
-    for cookie in session.cookies:
-        if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-            cookie_header_map[cookie.name] = cookie.value
-    cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+    cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
     headers = dict(session.headers)
     if cookie_header:
         headers["Cookie"] = cookie_header
 
     response = session.post(graphql_url, json=body, headers=headers, timeout=30)
 
-    raw_headers = getattr(response.raw, "headers", None)
-    if raw_headers is not None and hasattr(raw_headers, "get_all"):
-        cookie_values.extend(raw_headers.get_all("Set-Cookie") or [])
-    header_value = response.headers.get("Set-Cookie")
-    if header_value and header_value not in cookie_values:
-        cookie_values.append(header_value)
+    apply_set_cookie_headers(session, response, cookie_values)
 
-    for raw_cookie in cookie_values:
-        jar = SimpleCookie()
-        try:
-            jar.load(raw_cookie)
-        except Exception:
-            continue
-        for morsel in jar.values():
-            cookie_domain = morsel["domain"] or None
-            cookie_path = morsel["path"] or "/"
-            if morsel.value == "":
-                try:
-                    session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                except Exception:
-                    pass
-                continue
-            try:
-                session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-            except Exception:
-                pass
-            session.cookies.set(morsel.key, morsel.value, domain=cookie_domain, path=cookie_path, secure=bool(morsel["secure"]))
-
-    preferred = {}
-    for cookie in session.cookies:
-        if cookie.name not in IMPORTANT_COOKIE_NAMES:
-            continue
-        current = preferred.get(cookie.name)
-        score = (cookie.domain == ".netflix.com", cookie.path == "/", bool(cookie.value))
-        if current is None or score >= current[0]:
-            preferred[cookie.name] = (score, cookie)
-
-    for cookie in list(session.cookies):
-        winner = preferred.get(cookie.name)
-        if not winner:
-            continue
-        winner_cookie = winner[1]
-        if (cookie.domain, cookie.path, cookie.value) != (winner_cookie.domain, winner_cookie.path, winner_cookie.value):
-            try:
-                session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
-            except Exception:
-                pass
+    dedupe_important_cookies(session, IMPORTANT_COOKIE_NAMES)
 
     response.raise_for_status()
     login_data = response.json() 
 
-    flow_result: Dict[str, str] = {}
-    data = login_data.get("data", {})
-    operation_key = next(iter(data.keys()), "")
-    inner = data.get(operation_key, {})
-    screen = inner.get("screen", inner) if isinstance(inner, dict) else {}
-
-    stack = [screen]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            tracking_info = value.get("trackingInfo")
-            if isinstance(tracking_info, str) and tracking_info:
-                try:
-                    tracking = json.loads(tracking_info)
-                except Exception:
-                    tracking = {}
-                if tracking.get("clcsSessionId") and not flow_result.get("clcsSessionId"):
-                    flow_result["clcsSessionId"] = tracking.get("clcsSessionId", "")
-                if tracking.get("clcsRenditionId"):
-                    flow_result["renditionId"] = tracking.get("clcsRenditionId", "")
-            payload_json = value.get("payloadJson")
-            if isinstance(payload_json, str) and payload_json:
-                try:
-                    payload = json.loads(payload_json)
-                except Exception:
-                    payload = {}
-                if payload.get("flwssn") and not flow_result.get("flowSessionId"):
-                    flow_result["flowSessionId"] = payload.get("flwssn", "")
-                if payload.get("mode"):
-                    flow_result["mode"] = payload.get("mode", "")
-                if payload.get("flow"):
-                    flow_result["flow"] = payload.get("flow", "")
-            if value.get("membershipStatus"):
-                flow_result["membershipStatus"] = value.get("membershipStatus", "")
-            for child in value.values():
-                stack.append(child)
-        elif isinstance(value, list):
-            for item in value:
-                stack.append(item)
+    flow_result = parse_flow_data(login_data)
 
     membership = flow_result.get("membershipStatus", "")
     log.info("Membership: %s", membership)
@@ -3705,7 +2918,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
                 "Content-Type": "application/json",
                 "Connection": "Keep-Alive",
                 "x-netflix.context.sdk-version": "2025.2.3.0",
-                "X-Netflix.request.id": "".join(random.choice("0123456789ABCDEF") for _ in range(32)),
+                "X-Netflix.request.id": generate_hex_id(32, uppercase=True),
                 "X-Netflix.Request.Client.Context": '{"canvas":"OTHER","feature":"OTHER","appView":"appLoading","appstate":"foreground","reason":"unknown"}',
                 "X-Gibbon-Cache-Control": "no-cache",
                 "x-netflix.request.expiry.timeout": "20000",
@@ -3749,11 +2962,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
             },
         }
 
-        cookie_header_map = {}
-        for cookie in session.cookies:
-            if cookie.name in IMPORTANT_COOKIE_NAMES and cookie.value and cookie.name not in cookie_header_map:
-                cookie_header_map[cookie.name] = cookie.value
-        cookie_header = "; ".join(f"{name}={cookie_header_map[name]}" for name in IMPORTANT_COOKIE_NAMES if name in cookie_header_map)
+        cookie_header = build_cookie_header(session, IMPORTANT_COOKIE_NAMES)
         headers = dict(session.headers)
         if cookie_header:
             headers["Cookie"] = cookie_header
@@ -3767,27 +2976,6 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
             if header_value and header_value not in cookie_values:
                 cookie_values.append(header_value)
 
-            for raw_cookie in cookie_values:
-                jar = SimpleCookie()
-                try:
-                    jar.load(raw_cookie)
-                except Exception:
-                    continue
-                for morsel in jar.values():
-                    cookie_domain = morsel["domain"] or None
-                    cookie_path = morsel["path"] or "/"
-                    if morsel.value == "":
-                        try:
-                            session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                        except Exception:
-                            pass
-                        continue
-                    try:
-                        session.cookies.clear(domain=cookie_domain, path=cookie_path, name=morsel.key)
-                    except Exception:
-                        pass
-                    session.cookies.set(morsel.key, morsel.value, domain=cookie_domain, path=cookie_path, secure=bool(morsel["secure"]))
-
             if response.ok and session.cookies.get("gsid"):
                 log.info("gsid: %s", f"{session.cookies.get('gsid', 'N/A')[:80]}...")
             else:
@@ -3795,25 +2983,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
         except Exception as exc:
             log.warning("Post-login gsid fetch failed: %s", exc)
 
-    preferred = {}
-    for cookie in session.cookies:
-        if cookie.name not in IMPORTANT_COOKIE_NAMES:
-            continue
-        current = preferred.get(cookie.name)
-        score = (cookie.domain == ".netflix.com", cookie.path == "/", bool(cookie.value))
-        if current is None or score >= current[0]:
-            preferred[cookie.name] = (score, cookie)
-
-    for cookie in list(session.cookies):
-        winner = preferred.get(cookie.name)
-        if not winner:
-            continue
-        winner_cookie = winner[1]
-        if (cookie.domain, cookie.path, cookie.value) != (winner_cookie.domain, winner_cookie.path, winner_cookie.value):
-            try:
-                session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
-            except Exception:
-                pass
+    dedupe_important_cookies(session, IMPORTANT_COOKIE_NAMES)
 
     cookies: Dict[str, str] = {}
     for cookie in session.cookies:
@@ -3863,13 +3033,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
             recaptcha_token: str = ''):
     log = logging.getLogger('BROWSER MSL')
 
-    from typing import Any, Dict, Optional
-
-
-
-    BASE_DIR = Path(__file__).resolve().parent
-    OUTPUT_DIR = BASE_DIR / "output"
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR = ensure_output_dir("browser")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache_web.json"
     PRELOGIN_COOKIES_PATH = OUTPUT_DIR / "netflix_prelogin_cookies.json"
     AUTH_COOKIES_PATH = OUTPUT_DIR / "netflix_auth_cookies.json"
@@ -3890,7 +3054,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
     APP_VERSION = "ve300d66c"
     HAWKINS_VERSION = "5.16.0"
     UI_FLAVOR = "akira"
-    MSL_ESN = f"NFCDCH-02-{''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(32))}"
+    MSL_ESN = f"NFCDCH-02-{generate_hex_id(32, uppercase=True)}"
     REQUEST_CLIENT_CONTEXT = '{"appstate":"foreground"}'
     RECAPTCHA_SITE_KEY = "6Lf8hrcUAAAAAIpQAFW2VFjtiYnThOjZOA5xvLyR"
 
@@ -3935,7 +3099,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
     headers = {
         "Host": "web.prod.cloud.netflix.com",
         "Connection": "keep-alive",
-        "x-netflix.request.id": "".join(random.choice("0123456789abcdef") for _ in range(32)),
+        "x-netflix.request.id": generate_request_id(),
         "x-netflix.context.operation-name": operation_name,
         "x-netflix.request.originating.url": originating_url,
         "x-netflix.context.app-version": APP_VERSION,
@@ -3972,36 +3136,8 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
     response.raise_for_status()
     login_html = response.text
 
-    clcs_session_id = None
-    clcs_patterns = [
-        r'"clcsSessionId"\s*:\s*"([0-9a-f\-]{36})"',
-        r'\\"clcsSessionId\\"\s*:\s*\\"([0-9a-f\-]{36})\\"',
-        r'"serverState"\s*:\s*"[^\"]*clcsSessionId\\":\\"([0-9a-f\-]{36})',
-        r'"trackingInfo"\s*:\s*"[^\"]*clcsSessionId\\":\\"([0-9a-f\-]{36})',
-        r'"sessionId"\s*:\s*"([0-9a-f\-]{36})"',
-    ]
-    for pattern in clcs_patterns:
-        match = re.search(pattern, login_html)
-        if match:
-            clcs_session_id = match.group(1)
-            break
-
-    if not clcs_session_id:
-        raise RuntimeError("Could not extract clcsSessionId from the login page HTML")
-
-    rendition_id = None
-    rendition_patterns = [
-        r'"renditionId"\s*:\s*"([0-9a-f\-]{36})"',
-        r'\\"renditionId\\"\s*:\s*\\"([0-9a-f\-]{36})\\"',
-    ]
-    for pattern in rendition_patterns:
-        match = re.search(pattern, login_html)
-        if match:
-            rendition_id = match.group(1)
-            break
-
-    if not rendition_id:
-        raise RuntimeError("Could not extract the initial renditionId from the login page HTML")
+    clcs_session_id = extract_clcs_session_id(login_html)
+    rendition_id = extract_rendition_id(login_html)
 
     screen_name = "IDENTIFICATION"
     screen_name = "PASSWORD_LOGIN"
@@ -4054,7 +3190,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
         headers = {
             "Host": "web.prod.cloud.netflix.com",
             "Connection": "keep-alive",
-            "x-netflix.request.id": "".join(random.choice("0123456789abcdef") for _ in range(32)),
+            "x-netflix.request.id": generate_request_id(),
             "x-netflix.context.operation-name": operation_name,
             "x-netflix.request.originating.url": originating_url,
             "x-netflix.context.app-version": APP_VERSION,
@@ -4123,7 +3259,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
         headers = {
             "Host": "web.prod.cloud.netflix.com",
             "Connection": "keep-alive",
-            "x-netflix.request.id": "".join(random.choice("0123456789abcdef") for _ in range(32)),
+            "x-netflix.request.id": generate_request_id(),
             "x-netflix.context.operation-name": operation_name,
             "x-netflix.request.originating.url": originating_url,
             "x-netflix.context.app-version": APP_VERSION,
@@ -4200,7 +3336,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
         headers = {
             "Host": "web.prod.cloud.netflix.com",
             "Connection": "keep-alive",
-            "x-netflix.request.id": "".join(random.choice("0123456789abcdef") for _ in range(32)),
+            "x-netflix.request.id": generate_request_id(),
             "x-netflix.context.operation-name": operation_name,
             "x-netflix.request.originating.url": originating_url,
             "x-netflix.context.app-version": APP_VERSION,
@@ -4270,7 +3406,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
         headers = {
             "Host": "web.prod.cloud.netflix.com",
             "Connection": "keep-alive",
-            "x-netflix.request.id": "".join(random.choice("0123456789abcdef") for _ in range(32)),
+            "x-netflix.request.id": generate_request_id(),
             "x-netflix.context.operation-name": operation_name,
             "x-netflix.request.originating.url": originating_url,
             "x-netflix.context.app-version": APP_VERSION,
@@ -4309,7 +3445,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
     try:
         final_cookies = MSL_WEB.cookiejar_to_ordered_dict(session.cookies)
 
-        req_id = "".join(random.choice("0123456789abcdef") for _ in range(32))
+        req_id = generate_request_id()
         endpoint = (
             f"{MSL_ALE_ENDPOINT}?reqAttempt=1&reqName=aleProvision&reqId={req_id}"
             f"&clienttype={UI_FLAVOR}&uiversion={APP_VERSION}&browsername=chrome"
@@ -4346,7 +3482,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
         "auth_cookies": auth_cookies,
     }
 
-    print(json.dumps(result, indent=2))
+    #print(json.dumps(result, indent=2))
 
 
 # ======================================================================
@@ -4357,9 +3493,7 @@ def run_mgk(kpekph_path: Optional[Path], esnid: str,
             new_msl: bool = False):
     log = logging.getLogger('MGK MSL')
 
-    BASE_DIR = Path(__file__).resolve().parent
-    OUTPUT_DIR = BASE_DIR / "output"
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR = ensure_output_dir("mgk")
     MSL_CACHE_PATH = OUTPUT_DIR / "msl_keys_cache_mgk.json"
     AUTH_COOKIES_PATH = OUTPUT_DIR / "netflix_auth_cookies_mgk.json"
 
@@ -4415,15 +3549,9 @@ def run_mgk(kpekph_path: Optional[Path], esnid: str,
         log.exception("MGK authenticated request failed")
         sys.exit(1)
 
-    auth_cookies = {}
-    for cookie in session.cookies:
-        auth_cookies[cookie.name] = cookie.value
-
     try:
-        AUTH_COOKIES_PATH.write_text(json.dumps(auth_cookies, indent=2), encoding="utf-8")
-        log.info("Authentication cookies saved to: %s", AUTH_COOKIES_PATH)
+        auth_cookies = save_session_cookies(session, AUTH_COOKIES_PATH, log)
     except Exception:
-        log.exception("Failed to save cookies")
         sys.exit(1)
 
     result = {
@@ -4444,9 +3572,7 @@ def run_mgk(kpekph_path: Optional[Path], esnid: str,
 
 def main():
     parser = argparse.ArgumentParser(description="Netflix MSL multi-platform login")
-    parser.add_argument("--platform", required=True,
-                        choices=["android", "ios", "tv", "tv_otp", "web", "mgk"],
-                        help="Target platform")
+    parser.add_argument("--platform", required=True, choices=["android", "android_rsa", "ios", "tv", "tv_otp", "web", "mgk"], help="Target platform")
     parser.add_argument("--wvd", type=Path, help="Path to Widevine .wvd device file")
     parser.add_argument("--kpekph", type=Path, default=None, help="Path to KpeKph file (mgk platform); auto-discovered if omitted")
     parser.add_argument("--esnid", type=str, help="ESN identity string (mgk platform)")
@@ -4454,7 +3580,10 @@ def main():
     parser.add_argument("--no-verify", action="store_true", help="Skip TLS verification")
 
     args = parser.parse_args()
-
+    
+    if args.platform == "android_rsa":
+        run_android_rsa(new_msl=args.new_msl, no_verify=args.no_verify)
+        
     if args.platform == "android":
         if not args.wvd:
             parser.error("--wvd is required for android platform")

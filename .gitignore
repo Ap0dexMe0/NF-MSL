@@ -5,3 +5,4 @@ venv/*
 output/*
 .vscode/*
 modules/__pycache__/
+__pycache__/
