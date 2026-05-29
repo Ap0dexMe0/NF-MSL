@@ -389,7 +389,7 @@ def run_ios(wvd_path: Path,
             new_msl: bool = False, no_verify: bool = False):
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import unpad
-    log = logging.getLogger('netflix_ios_login')
+    log = logging.getLogger('IOS MSL')
 
     from typing import Any, Dict
 
@@ -802,7 +802,7 @@ def run_tv(wvd_path: Path,
            new_msl: bool = False, no_verify: bool = False):
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import unpad
-    log = logging.getLogger('netflix_tv_login')
+    log = logging.getLogger('ANDROID TV MSL')
 
 
 
@@ -2241,7 +2241,7 @@ def run_tv(wvd_path: Path,
 # ======================================================================
 
 def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
-    log = logging.getLogger('netflix_tv_login')
+    log = logging.getLogger('ANDROID TV MSL')
 
 
     from typing import Any, Dict, List
@@ -3861,7 +3861,7 @@ def run_tv_otp(wvd_path: Path, new_msl: bool = False, no_verify: bool = False):
 
 def run_web(new_msl: bool = False, no_verify: bool = False,
             recaptcha_token: str = ''):
-    log = logging.getLogger('netflix_web_login')
+    log = logging.getLogger('BROWSER MSL')
 
     from typing import Any, Dict, Optional
 
@@ -4355,7 +4355,7 @@ def run_web(new_msl: bool = False, no_verify: bool = False,
 
 def run_mgk(kpekph_path: Optional[Path], esnid: str,
             new_msl: bool = False):
-    log = logging.getLogger('netflix_mgk_login')
+    log = logging.getLogger('MGK MSL')
 
     BASE_DIR = Path(__file__).resolve().parent
     OUTPUT_DIR = BASE_DIR / "output"
