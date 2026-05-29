@@ -1,6 +1,7 @@
-# Netflix MSL Multi-Platform Login
+# Netflix MSL Universal Handshake
 
-A Python toolkit for performing Netflix MSL (Message Security Layer) authentication across five different client platforms. Credentials are configured once in `config.ini` and are never passed on the command line.
+> A cross-platform MSL (Message Security Layer) authentication toolkit for Netflix.  
+> Implements a unified handshake layer that works across Android, iOS, Smart TV, Web, and MGK — all driven from a single entry point with shared credential management.
 
 ---
 
@@ -281,12 +282,4 @@ MSL key caches are reused across runs to avoid a full handshake every time. They
 
 ---
 
-## Module Overview
-
-| Module | Class | Key-exchange scheme | Auth scheme |
-|--------|-------|--------------------|----|
-| `msl_android.py` | `MSL_ANDROID` | RSA + Widevine | Email/password via MSL |
-| `msl_ios.py` | `MSL_IOS` | RSA + Widevine | GraphQL `CLCSScreenUpdate` |
-| `msl_tv.py` | `MSL_TV` | RSA + Widevine | GraphQL CLCS moneyball |
-| `msl_web.py` | `MSL_WEB` | RSA | GraphQL `CLCSScreenUpdate` |
-| `msl_mgk.py` | `MSL_MGK` | AUTHENTICATED_DH / MGK | `EMAIL_PASSWORD` user-auth |
+**Credits:** [Hugoved](https://github.com/Hugoved)
