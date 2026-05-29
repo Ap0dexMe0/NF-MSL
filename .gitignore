@@ -4,4 +4,4 @@ cookies/*
 venv/*
 output/*
 .vscode/*
-modules/pycache__/
+modules/__pycache__/
