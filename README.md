@@ -7,8 +7,6 @@
 
 ## Table of Contents
 
-- [Requirements](#requirements)
-- [Project Structure](#project-structure)
 - [Configuration](#configuration)
 - [Devices (WVD Files)](#devices-wvd-files)
 - [Platforms](#platforms)
@@ -19,20 +17,7 @@
   - [Web](#web)
   - [MGK (Model Group Key)](#mgk-model-group-key)
 - [Usage](#usage)
-- [Output Files](#output-files)
-- [Module Overview](#module-overview)
-
 ---
-
-## Requirements
-
-```
-Python >= 3.9
-requests
-pycryptodome  (Cryptodome)
-pywidevine
-jsonpickle
-```
 
 Install all dependencies:
 
@@ -40,30 +25,6 @@ Install all dependencies:
 pip install -r requirements.txt
 ```
 
----
-
-## Project Structure
-
-```
-.
-├── main.py                  # Entry point — platform router
-├── config.ini               # Credentials (EMAIL / PASSWORD)
-├── devices/
-│   ├── l3.wvd   # L3 Android/iOS WVD
-│   └── l1.wvd          # L1 TV WVD
-│   └── KpeKph          MGK KpeKph platform: base64 encryption + HMAC keys (comma-separated)
-│   └── ESNID           # MGK platform: model-group identity string
-├── modules/
-│   ├── __init__.py
-│   ├── config.py            # config.ini loader
-│   ├── msl_android.py       # MSL_ANDROID class
-│   ├── msl_ios.py           # MSL_IOS class
-│   ├── msl_tv.py            # MSL_TV class
-│   ├── msl_web.py           # MSL_WEB class
-│   └── msl_mgk.py           # MSL_MGK class (Model Group Key)                   
-```
-
----
 
 ## Configuration
 
@@ -257,30 +218,9 @@ python main.py --platform web --recaptcha-token <token>
 
 ---
 
-## Output Files
-
-Each platform writes its results to the same directory as `main.py`:
-
-| File | Platform(s) | Contents |
-|------|-------------|----------|
-| `netflix_auth_cookies.json` | android, ios, web | Session cookies (`NetflixId`, `SecureNetflixId`, etc.) |
-| `netflix_auth_tokens.json` | android | Full MSL header data including `useridtoken` |
-| `netflix_auth_useridtoken.json` | android | Extracted `useridtoken` only |
-| `netflix_cookies.json` | tv, tv_otp | Filtered important cookies |
-| `useridtoken.json` | tv, tv_otp | MSL `useridtoken` |
-| `msl_debug_trace.json` | tv | Decrypted MSL payload trace log |
-| `password_login_response.json` | tv | Raw CLCS credential-submit response |
-| `useridtoken_mgk.json` | mgk | MSL `useridtoken` from MGK flow |
-| `netflix_auth_cookies_mgk.json` | mgk | Session cookies from MGK flow |
-| `msl_keys_cache_android.json` | android | Cached MSL session keys |
-| `msl_keys_cache_ios.json` | ios | Cached MSL session keys |
-| `msl_keys_cache.json` | tv, tv_otp | Cached MSL session keys |
-| `msl_keys_cache_web.json` | web | Cached MSL session keys |
-| `msl_keys_cache_mgk.json` | mgk | Cached MSL session keys |
-
 MSL key caches are reused across runs to avoid a full handshake every time. They expire automatically when the master token has fewer than 10 hours remaining.
 
 ---
 
 **Big thanks to [Hugoved](https://github.com/Hugoved)**
-- for the foundational work on MSL (Message Security Layer) reverse engineering, and the original pywidevine implementation that made this unified handshake toolkit possible. This project builds upon years of community research into Netflix's authentication protocols.
+- for the foundational work on MSL (Message Security Layer) reverse engineering, and the original pywidevine implementation that made this unified handshake toolkit possible.
