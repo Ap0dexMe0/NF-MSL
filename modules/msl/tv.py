@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import random
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 from typing import Any, Dict, List, Optional, Tuple
 
 import jsonpickle
@@ -13,7 +16,7 @@ from Cryptodome.PublicKey import RSA
 from Cryptodome.PublicKey.RSA import RsaKey
 from pywidevine import Cdm as WidevineCdm, Device as WidevineDevice, PSSH
 
-from .msl_base import MSLBase, MSLKeys as _BaseMSLKeys, get_widevine_key
+from .base import MSLBase, MSLKeys as _BaseMSLKeys, get_widevine_key
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +95,9 @@ class MSL_TV(MSLBase):
         sender: str,
         user_auth: Optional[dict] = None,
         drm: str = "widevine",
+        proxy: Optional[Dict[str, str]] = None,
     ) -> None:
-        super().__init__(session=session, keys=keys, message_id=message_id, sender=sender)
+        super().__init__(session=session, keys=keys, message_id=message_id, sender=sender, proxy=proxy)
         self.user_auth = user_auth
         self.drm = drm
 
@@ -114,19 +118,23 @@ class MSL_TV(MSLBase):
         headers: Optional[Dict[str, str]] = None,
     ) -> MSLKeys:
         """Perform a key exchange using Widevine (if CDM available) or RSA."""
+        _log.info("TV MSL handshake: sender=%s, drm=%s", sender, drm)
         if cookies:
             session.cookies.update(cookies)
 
         cache_path = Path(msl_keys_path)
         msl_keys = cls.load_cache_data(cache_path)
         if msl_keys is not None and not new_msl:
+            _log.info("Reusing cached MSL keys")
             return msl_keys
+        _log.info("Performing fresh key exchange")
 
         message_id = random.randint(0, pow(2, 52))
         msl_keys = MSLKeys()
 
         # ---- Choose DRM scheme ---------------------------------------------
         if not cdm and drm == "widevine":
+            _log.debug("No CDM provided — falling back to RSA key exchange")
             # No CDM provided – fall back to RSA key exchange
             msl_keys.rsa = RSA.generate(2048)
             assert msl_keys.rsa is not None
@@ -141,6 +149,7 @@ class MSL_TV(MSLBase):
                 },
             }
         elif drm == "widevine":
+            _log.debug("Using Widevine DRM for key exchange")
             # CDM available – use Widevine
             if not isinstance(cdm, WidevineCdm):
                 device = WidevineDevice.load(cdm_device)
@@ -204,9 +213,11 @@ class MSL_TV(MSLBase):
             host="nrdp25.prod.ftl.netflix.com",
             language="en-US,en-PH,en",
         )
+        _log.debug("TV handshake request → %s", handshake_endpoint)
         res = session.post(
             url=handshake_endpoint, data=data, headers=handshake_headers, timeout=30
         )
+        _log.debug("TV handshake response ← HTTP %d", res.status_code)
 
         if res.status_code != 200:
             raise RuntimeError(
@@ -274,6 +285,7 @@ class MSL_TV(MSLBase):
 
         msl_keys.mastertoken = key_response_data["mastertoken"]
         cls.cache_keys(msl_keys, cache_path)
+        _log.info("TV key exchange complete")
         return msl_keys
 
     # -- Platform-specific request headers -----------------------------------

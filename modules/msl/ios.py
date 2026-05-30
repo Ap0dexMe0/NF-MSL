@@ -1,9 +1,12 @@
 import base64
 import gzip
 import json
+import logging
 import random
 import sys
 import zlib
+
+_log = logging.getLogger(__name__)
 import jsonpickle
 import requests
 from io import BytesIO
@@ -71,6 +74,7 @@ class MSL_IOS:
         sender: str,
         user_auth: Optional[dict] = None,
         drm: str = "widevine",
+        proxy: Optional[Dict[str, str]] = None,
     ):
         self.session = session
         self.keys = keys
@@ -78,6 +82,7 @@ class MSL_IOS:
         self.user_auth = user_auth
         self.message_id = message_id
         self.drm = drm
+        self.proxy = proxy
 
     @classmethod
     def handshake(
@@ -93,13 +98,16 @@ class MSL_IOS:
         endpoint: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> MSLKeys:
+        _log.info("iOS Widevine handshake: sender=%s", sender)
         if cookies:
             session.cookies.update(cookies)
 
         cache_path = Path(msl_keys_path)
         msl_keys = MSL_IOS.load_cache_data(cache_path)
         if msl_keys is not None and not new_msl:
+            _log.info("Reusing cached MSL keys")
             return msl_keys
+        _log.info("Performing fresh Widevine key exchange")
 
         if drm != "widevine":
             raise ValueError(f"Unsupported DRM mode: {drm}")
@@ -171,7 +179,9 @@ class MSL_IOS:
             host="ios.prod.ftl.netflix.com",
             language="en-US,en",
         )
+        _log.debug("Widevine handshake request → %s", handshake_endpoint)
         res = session.post(url=handshake_endpoint, data=data, headers=handshake_headers, timeout=30)
+        _log.debug("Widevine handshake response ← HTTP %d", res.status_code)
 
         if res.status_code != 200:
             raise RuntimeError(f"Key exchange failed: HTTP {res.status_code} {res.text[:500]}")
@@ -211,6 +221,7 @@ class MSL_IOS:
 
         msl_keys.mastertoken = key_response_data["mastertoken"]
         MSL_IOS.cache_keys(msl_keys, cache_path)
+        _log.info("Widevine key exchange complete")
         return msl_keys
 
     @staticmethod
@@ -325,8 +336,9 @@ class MSL_IOS:
             "headers": headers,
             "timeout": 30,
         }
-        if proxy:
-            request_kwargs["proxies"] = proxy
+        effective_proxy = proxy or self.proxy
+        if effective_proxy:
+            request_kwargs["proxies"] = effective_proxy
         res = self.session.post(**request_kwargs)
         header, payload_data = self.parse_message(res.text)
         if "errordata" in header:

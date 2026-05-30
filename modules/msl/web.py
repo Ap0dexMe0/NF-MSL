@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import random
 from collections import OrderedDict
+
+_log = logging.getLogger(__name__)
 from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from pathlib import Path
@@ -15,7 +18,7 @@ from Cryptodome.Cipher import PKCS1_OAEP
 from Cryptodome.PublicKey import RSA
 from Cryptodome.PublicKey.RSA import RsaKey
 
-from .msl_base import MSLBase, MSLKeys as _BaseMSLKeys
+from .base import MSLBase, MSLKeys as _BaseMSLKeys
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +68,9 @@ class MSL_WEB(MSLBase):
         message_id: int,
         sender: str,
         user_auth: Optional[dict] = None,
+        proxy: Optional[Dict[str, str]] = None,
     ) -> None:
-        super().__init__(session=session, keys=keys, message_id=message_id, sender=sender)
+        super().__init__(session=session, keys=keys, message_id=message_id, sender=sender, proxy=proxy)
         self.user_auth = user_auth
 
     # -- RSA handshake -------------------------------------------------------
@@ -83,17 +87,21 @@ class MSL_WEB(MSLBase):
         headers: Optional[Dict[str, str]] = None,
     ) -> MSLKeys:
         """Perform an RSA (ASYMMETRIC_WRAPPED) key exchange."""
+        _log.info("Web RSA handshake: sender=%s", sender)
         if cookies:
             session.cookies.update(cookies)
 
         cache_path = Path(msl_keys_path)
         cached = cls.load_cache_data(cache_path)
         if cached is not None and not new_msl:
+            _log.info("Reusing cached MSL keys")
             return cached
+        _log.info("Performing fresh RSA key exchange")
 
         message_id = random.randint(0, 2**52)
         keys = MSLKeys()
         keys.rsa = RSA.generate(2048)
+        _log.debug("Generated RSA-2048 ephemeral keypair")
 
         keyrequestdata = {
             "scheme": "ASYMMETRIC_WRAPPED",
@@ -141,12 +149,14 @@ class MSL_WEB(MSLBase):
             separators=(",", ":"),
         )
 
+        _log.debug("Web handshake request → %s", endpoint or cls.DEFAULT_HANDSHAKE_ENDPOINT)
         response = session.post(
             url=endpoint or cls.DEFAULT_HANDSHAKE_ENDPOINT,
             data=envelope,
             headers=headers or cls.build_request_headers(request_name="aleProvision"),
             timeout=30,
         )
+        _log.debug("Web handshake response ← HTTP %d", response.status_code)
         if response.status_code != 200:
             raise RuntimeError(
                 f"Key exchange failed: HTTP {response.status_code} {response.text[:500]}"
@@ -190,6 +200,7 @@ class MSL_WEB(MSLBase):
         keys.mastertoken = header_json["keyresponsedata"]["mastertoken"]
 
         cls.cache_keys(keys, cache_path)
+        _log.info("Web RSA key exchange complete")
         return keys
 
     # -- Platform-specific request headers -----------------------------------

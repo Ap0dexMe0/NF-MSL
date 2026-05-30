@@ -4,9 +4,12 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import logging
 import random
 import re
 import zlib
+
+_log = logging.getLogger(__name__)
 
 import jsonpickle
 import requests
@@ -99,12 +102,14 @@ class MSLBase:
         keys: MSLKeys,
         message_id: int,
         sender: str,
+        proxy: Optional[Dict[str, str]] = None,
         **_kwargs: Any,
     ) -> None:
         self.session = session
         self.keys = keys
         self.sender = sender
         self.message_id = message_id
+        self.proxy = proxy
 
     # -----------------------------------------------------------------------
     # JSON helpers
@@ -364,6 +369,7 @@ class MSLBase:
         timeout: int = 30,
     ) -> Tuple[Dict[str, Any], Any]:
         message = self.create_message(application_data, userauthdata)
+        _log.debug("MSL → %s", endpoint)
         request_kwargs: Dict[str, Any] = {
             "url": endpoint,
             "data": message,
@@ -371,12 +377,15 @@ class MSLBase:
             "headers": headers,
             "timeout": timeout,
         }
-        if proxy:
-            request_kwargs["proxies"] = proxy
+        effective_proxy = proxy or self.proxy
+        if effective_proxy:
+            request_kwargs["proxies"] = effective_proxy
 
         res = self.session.post(**request_kwargs)
+        _log.debug("MSL ← HTTP %d (%d bytes)", res.status_code, len(res.content))
 
         if res.status_code != 200:
+            _log.warning("MSL request failed: HTTP %d — %s", res.status_code, res.text[:200])
             raise RuntimeError(
                 f"MSL request failed with HTTP {res.status_code}: {res.text[:500]}"
             )
@@ -480,6 +489,7 @@ class MSLBase:
         """Load cached MSL keys from disk.  Returns ``None`` if the cache is
         missing, corrupt, or the token is about to expire (< 10 h remaining)."""
         if not msl_keys_path or not msl_keys_path.is_file():
+            _log.debug("MSL cache miss: %s", msl_keys_path)
             return None
 
         msl_keys = jsonpickle.decode(msl_keys_path.read_text(encoding="utf-8"))
@@ -492,11 +502,14 @@ class MSLBase:
             )
             remaining_hours = (renewal_window - datetime.now(timezone.utc)).total_seconds() / 3600
             if remaining_hours < 10:
+                _log.debug("MSL cache expired (%.1fh remaining): %s", remaining_hours, msl_keys_path)
                 return None
+        _log.debug("MSL cache hit: %s", msl_keys_path)
         return msl_keys
 
     @staticmethod
     def cache_keys(msl_keys: MSLKeys, msl_keys_path: Path) -> None:
         """Persist *msl_keys* to *msl_keys_path*."""
+        _log.debug("Caching MSL keys → %s", msl_keys_path)
         msl_keys_path.parent.mkdir(parents=True, exist_ok=True)
         msl_keys_path.write_text(jsonpickle.encode(msl_keys, indent=4), encoding="utf-8")

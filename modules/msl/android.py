@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import random
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 from typing import Any, Dict, List, Optional, Tuple
 
 import jsonpickle
@@ -14,7 +17,7 @@ from Cryptodome.PublicKey import RSA
 from Cryptodome.PublicKey.RSA import RsaKey
 from pywidevine import Cdm as WidevineCdm, Device as WidevineDevice, PSSH
 
-from modules.msl_base import MSLBase, MSLKeys as _BaseMSLKeys, get_widevine_key
+from modules.msl.base import MSLBase, MSLKeys as _BaseMSLKeys, get_widevine_key
 
 
 # ---------------------------------------------------------------------------
@@ -86,8 +89,9 @@ class MSL_ANDROID(MSLBase):
         sender: str,
         user_auth: Optional[dict] = None,
         drm: str = "widevine",
+        proxy: Optional[Dict[str, str]] = None,
     ) -> None:
-        super().__init__(session=session, keys=keys, message_id=message_id, sender=sender)
+        super().__init__(session=session, keys=keys, message_id=message_id, sender=sender, proxy=proxy)
         self.user_auth = user_auth
         self.drm = drm
 
@@ -108,13 +112,16 @@ class MSL_ANDROID(MSLBase):
         headers: Optional[Dict[str, str]] = None,
     ) -> MSLKeys:
         """Perform a Widevine key exchange and return negotiated keys."""
+        _log.info("Android Widevine handshake: sender=%s", sender)
         if cookies:
             session.cookies.update(cookies)
 
         cache_path = Path(msl_keys_path)
         msl_keys = cls.load_cache_data(cache_path)
         if msl_keys is not None and not new_msl:
+            _log.info("Reusing cached MSL keys")
             return msl_keys
+        _log.info("Performing fresh Widevine key exchange")
 
         if drm != "widevine":
             raise ValueError(f"Unsupported DRM mode: {drm}")
@@ -135,6 +142,7 @@ class MSL_ANDROID(MSLBase):
             cdm_session,
             PSSH.new(system_id=PSSH.SystemId.Widevine),
         )
+        _log.debug("Widevine challenge created (%d bytes)", len(challenge))
         wv_request = base64.b64encode(challenge).decode("utf-8")
         keyrequestdata = {
             "scheme": "WIDEVINE",
@@ -186,9 +194,11 @@ class MSL_ANDROID(MSLBase):
             host="android15.prod.cloud.netflix.com",
             language="en-US,en",
         )
+        _log.debug("Widevine handshake request → %s", handshake_endpoint)
         res = session.post(
             url=handshake_endpoint, data=data, headers=handshake_headers, timeout=30
         )
+        _log.debug("Widevine handshake response ← HTTP %d", res.status_code)
 
         if res.status_code != 200:
             raise RuntimeError(
@@ -235,6 +245,7 @@ class MSL_ANDROID(MSLBase):
 
         msl_keys.mastertoken = key_response_data["mastertoken"]
         cls.cache_keys(msl_keys, cache_path)
+        _log.info("Widevine key exchange complete")
         return msl_keys
 
     # -- RSA / ASYMMETRIC_WRAPPED handshake (no Widevine required) -----------
@@ -259,16 +270,20 @@ class MSL_ANDROID(MSLBase):
         The ESN must use the ``NFCDCH-02-`` prefix (web-style) so that the
         Android FTL endpoint accepts the ``NONE`` entity auth scheme.
         """
+        _log.info("Android RSA handshake: sender=%s", sender)
         if cookies:
             session.cookies.update(cookies)
 
         cache_path = Path(msl_keys_path)
         cached = cls.load_cache_data(cache_path)
         if cached is not None and not new_msl:
+            _log.info("Reusing cached RSA MSL keys")
             return cached
+        _log.info("Performing fresh RSA key exchange")
 
         # ---- Generate ephemeral RSA-2048 keypair ----------------------------
         rsa_key = RSA.generate(2048)
+        _log.debug("Generated RSA-2048 ephemeral keypair")
         pub_der_b64 = base64.b64encode(
             rsa_key.publickey().export_key("DER")
         ).decode("ascii")
@@ -326,12 +341,14 @@ class MSL_ANDROID(MSLBase):
             host="android15.prod.cloud.netflix.com",
             language="en-US,en",
         )
+        _log.debug("RSA handshake request → %s", handshake_endpoint)
         res = session.post(
             url=handshake_endpoint,
             data=data,
             headers=handshake_headers,
             timeout=30,
         )
+        _log.debug("RSA handshake response ← HTTP %d", res.status_code)
 
         if res.status_code != 200:
             raise RuntimeError(
@@ -374,6 +391,7 @@ class MSL_ANDROID(MSLBase):
         # Don't persist the RSA key object (not picklable); clear it before caching
         msl_keys.rsa = None
         cls.cache_keys(msl_keys, cache_path)
+        _log.info("RSA key exchange complete")
         return msl_keys
 
     @staticmethod
